@@ -1,6 +1,6 @@
 [package]
 name = "bitcut"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Create and apply binary patches"
 license = "MIT"
@@ -33,3 +33,10 @@ optional = true
 [features]
 default = ["cli"]
 cli = ["clap", "anyhow"]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "my_benchmark"
+harness = false

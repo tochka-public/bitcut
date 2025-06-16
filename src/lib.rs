@@ -1,7 +1,8 @@
 use std::fmt;
 use std::{collections::HashMap, fmt::Debug};
 
-const WINDOW_SIZE: usize = 8;
+const WINDOW_SIZE: usize = 10;
+const BASE: u64 = 1_934_123_457;
 
 #[derive(PartialEq, Eq)]
 pub enum Op<'a> {
@@ -108,51 +109,43 @@ impl Debug for Op<'_> {
     }
 }
 
-fn build_hash_map(old: &[u8]) -> HashMap<&[u8], usize, ahash::RandomState> {
-    let mut map =
-        HashMap::with_capacity_and_hasher(old.len() / WINDOW_SIZE, ahash::RandomState::default());
-    for i in 0..=old.len().saturating_sub(WINDOW_SIZE) {
-        map.insert(&old[i..i + WINDOW_SIZE], i);
-    }
-    map
+fn build_hash_map(data: &[u8]) -> HashMap<u64, usize, ahash::RandomState> {
+    RollingHash::new(data, WINDOW_SIZE, BASE)
+        .map(|rh| rh.into_iter().enumerate().map(|(i, h)| (h, i)).collect())
+        .unwrap_or_default()
 }
 
 pub fn make_diff(old: &[u8], new: &[u8]) -> Vec<u8> {
     if new.len() < WINDOW_SIZE || old.len() < WINDOW_SIZE {
-        let mut patch = vec![];
+        let mut patch = Vec::with_capacity(new.len() + 5);
         Op::Add(new).serialize_to(&mut patch);
         return patch;
     }
 
-    let mut patch = Vec::with_capacity(512);
     let map = build_hash_map(old);
-    let mut i = 0;
+    let rh = RollingHash::new(new, WINDOW_SIZE, BASE).unwrap();
+    let mut patch = Vec::with_capacity(512);
+    let mut last_emitted = 0;
 
-    while i < new.len() {
-        if i + WINDOW_SIZE <= new.len() {
-            let window = &new[i..i + WINDOW_SIZE];
-            if let Some(&pos) = map.get(window) {
-                let len = simd_memcmp(&new[i..], &old[pos..]);
-                let op = Op::Copy(pos as u32, len as u32);
-                op.serialize_to(&mut patch);
-                i += len;
-                continue;
-            }
+    for (idx, hash) in rh.enumerate() {
+        if last_emitted > idx {
+            continue;
         }
 
-        let start = i;
-        i += 1;
-        while i < new.len() {
-            if i + WINDOW_SIZE <= new.len() {
-                let window = &new[i..i + WINDOW_SIZE];
-                if map.contains_key(window) {
-                    break;
+        if let Some(&match_pos) = map.get(&hash) {
+            let len = simd_memcmp(&new[idx..], &old[match_pos..]);
+            if len >= WINDOW_SIZE {
+                if idx > last_emitted {
+                    Op::Add(&new[last_emitted..idx]).serialize_to(&mut patch);
                 }
+                Op::Copy(match_pos as u32, len as u32).serialize_to(&mut patch);
+                last_emitted = idx + len;
             }
-            i += 1;
         }
+    }
 
-        Op::Add(&new[start..i]).serialize_to(&mut patch);
+    if last_emitted < new.len() {
+        Op::Add(&new[last_emitted..]).serialize_to(&mut patch);
     }
 
     patch
@@ -269,12 +262,76 @@ fn simd_memcmp_fallback(a: &[u8], b: &[u8]) -> usize {
     i
 }
 
+pub struct RollingHash<'a> {
+    data: &'a [u8],
+    pos: usize,
+    window_size: usize,
+    base_pow: u64,
+    hash: u64,
+    base: u64,
+}
+
+impl<'a> RollingHash<'a> {
+    pub fn new(data: &'a [u8], window_size: usize, base: u64) -> Option<Self> {
+        if data.len() < window_size {
+            return None;
+        }
+
+        let mut hash: u64 = 0;
+        let mut base_pow: u64 = 1;
+
+        for (i, byte) in data.iter().enumerate().take(window_size) {
+            hash = hash.wrapping_mul(base).wrapping_add(*byte as u64);
+            if i < window_size - 1 {
+                base_pow = base_pow.wrapping_mul(base);
+            }
+        }
+
+        Some(Self {
+            data,
+            pos: 0,
+            window_size,
+            base_pow,
+            hash,
+            base,
+        })
+    }
+}
+
+impl<'a> Iterator for RollingHash<'a> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos + self.window_size > self.data.len() {
+            return None;
+        }
+
+        let out = self.data[self.pos] as u64;
+        let next = self.pos + self.window_size;
+        let result = self.hash;
+
+        if next < self.data.len() {
+            let r#in = self.data[next] as u64;
+            self.hash = self
+                .hash
+                .wrapping_sub(out.wrapping_mul(self.base_pow))
+                .wrapping_mul(self.base)
+                .wrapping_add(r#in);
+        }
+
+        self.pos += 1;
+        Some(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
-    fn test() {
+    fn test_patches() {
         let digits = (0..100).into_iter().collect::<Vec<_>>();
         let tail = vec![0, 1];
         let shifted_digits = digits
@@ -301,9 +358,9 @@ mod tests {
                 Some(vec![Op::Add(&[])]),
             ),
             (
-                b"-foo-bar-hello-world".into(),
-                b"hello-world-foo-bar-baz".into(),
-                Some(vec![Op::Copy(9, 11), Op::Copy(0, 9), Op::Add(&baz)]),
+                b"-foo-baar-hello-world".into(),
+                b"hello-world-foo-baar-baz".into(),
+                Some(vec![Op::Copy(10, 11), Op::Copy(0, 10), Op::Add(&baz)]),
             ),
             (
                 b"just-swaps-with-no-adds".into(),
@@ -321,5 +378,22 @@ mod tests {
             let patched = apply_patch(&old, &patch).unwrap();
             assert_eq!(&patched, &new);
         }
+    }
+
+    #[test]
+    fn test_rolling_hash() {
+        const WND: usize = 3;
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4, 5, 6, 7, 2, 3, 4, 8];
+        let rh = RollingHash::new(&data, WND, 1_934_123_457).unwrap();
+        let hashes: Vec<_> = data
+            .as_slice()
+            .windows(WND)
+            .enumerate()
+            .zip(rh)
+            .filter(|((_, wnd), _)| wnd == &[2, 3, 4])
+            .map(|((_, _), hash)| hash)
+            .collect();
+        assert!(hashes.len() > 1);
+        assert_eq!(hashes.into_iter().collect::<HashSet<_>>().len(), 1);
     }
 }
