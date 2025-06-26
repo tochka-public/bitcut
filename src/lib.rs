@@ -1,6 +1,6 @@
+use rustc_hash::FxHashMap;
 use std::fmt;
-use std::{collections::HashMap, fmt::Debug};
-
+use std::fmt::Debug;
 const WINDOW_SIZE: usize = 10;
 const BASE: u64 = 1_934_123_457;
 
@@ -109,7 +109,7 @@ impl Debug for Op<'_> {
     }
 }
 
-fn build_hash_map(data: &[u8]) -> HashMap<u64, usize, ahash::RandomState> {
+fn build_hash_map(data: &[u8]) -> FxHashMap<u64, usize> {
     RollingHash::new(data, WINDOW_SIZE, BASE)
         .map(|rh| rh.into_iter().enumerate().map(|(i, h)| (h, i)).collect())
         .unwrap_or_default()
