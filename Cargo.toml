@@ -1,6 +1,6 @@
 [package]
 name = "bitcut"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Create and apply binary patches"
 license = "MIT"
@@ -19,7 +19,7 @@ required-features = ["cli"]
 path = "src/main.rs"
 
 [dependencies]
-ahash = "0.8"
+rustc-hash = "2.1"
 
 [dependencies.clap]
 version = "4.5"
