@@ -1,6 +1,6 @@
+use rustc_hash::FxHashMap;
 use std::fmt;
-use std::{collections::HashMap, fmt::Debug};
-
+use std::fmt::Debug;
 const WINDOW_SIZE: usize = 10;
 const BASE: u64 = 1_934_123_457;
 
@@ -109,7 +109,7 @@ impl Debug for Op<'_> {
     }
 }
 
-fn build_hash_map(data: &[u8]) -> HashMap<u64, usize, ahash::RandomState> {
+fn build_hash_map(data: &[u8]) -> FxHashMap<u64, usize> {
     RollingHash::new(data, WINDOW_SIZE, BASE)
         .map(|rh| rh.into_iter().enumerate().map(|(i, h)| (h, i)).collect())
         .unwrap_or_default()
@@ -123,15 +123,12 @@ pub fn make_diff(old: &[u8], new: &[u8]) -> Vec<u8> {
     }
 
     let map = build_hash_map(old);
-    let rh = RollingHash::new(new, WINDOW_SIZE, BASE).unwrap();
     let mut patch = Vec::with_capacity(512);
     let mut last_emitted = 0;
-
-    for (idx, hash) in rh.enumerate() {
-        if last_emitted > idx {
-            continue;
-        }
-
+    let mut idx = 0;
+    while idx + WINDOW_SIZE <= new.len() {
+        let window = &new[idx..idx + WINDOW_SIZE];
+        let (hash, _) = window_hash(window, BASE);
         if let Some(&match_pos) = map.get(&hash) {
             let len = simd_memcmp(&new[idx..], &old[match_pos..]);
             if len >= WINDOW_SIZE {
@@ -139,15 +136,16 @@ pub fn make_diff(old: &[u8], new: &[u8]) -> Vec<u8> {
                     Op::Add(&new[last_emitted..idx]).serialize_to(&mut patch);
                 }
                 Op::Copy(match_pos as u32, len as u32).serialize_to(&mut patch);
-                last_emitted = idx + len;
+                idx += len;
+                last_emitted = idx;
+                continue;
             }
         }
+        idx += 1;
     }
-
     if last_emitted < new.len() {
         Op::Add(&new[last_emitted..]).serialize_to(&mut patch);
     }
-
     patch
 }
 
@@ -176,6 +174,7 @@ pub fn apply_patch(old: &[u8], patch: &[u8]) -> Result<Vec<u8>, &'static str> {
     Ok(out)
 }
 
+#[inline]
 fn simd_memcmp(a: &[u8], b: &[u8]) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
@@ -262,6 +261,19 @@ fn simd_memcmp_fallback(a: &[u8], b: &[u8]) -> usize {
     i
 }
 
+#[inline]
+fn window_hash(data: &[u8], base: u64) -> (u64, u64) {
+    let mut hash: u64 = 0;
+    let mut base_pow: u64 = 1;
+    for (i, &byte) in data.iter().enumerate() {
+        hash = hash.wrapping_mul(base).wrapping_add(byte as u64);
+        if i < data.len() - 1 {
+            base_pow = base_pow.wrapping_mul(base);
+        }
+    }
+    (hash, base_pow)
+}
+
 pub struct RollingHash<'a> {
     data: &'a [u8],
     pos: usize,
@@ -276,17 +288,7 @@ impl<'a> RollingHash<'a> {
         if data.len() < window_size {
             return None;
         }
-
-        let mut hash: u64 = 0;
-        let mut base_pow: u64 = 1;
-
-        for (i, byte) in data.iter().enumerate().take(window_size) {
-            hash = hash.wrapping_mul(base).wrapping_add(*byte as u64);
-            if i < window_size - 1 {
-                base_pow = base_pow.wrapping_mul(base);
-            }
-        }
-
+        let (hash, base_pow) = window_hash(&data[..window_size], base);
         Some(Self {
             data,
             pos: 0,
@@ -301,6 +303,7 @@ impl<'a> RollingHash<'a> {
 impl<'a> Iterator for RollingHash<'a> {
     type Item = u64;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos + self.window_size > self.data.len() {
             return None;
@@ -332,7 +335,7 @@ mod tests {
 
     #[test]
     fn test_patches() {
-        let digits = (0..100).into_iter().collect::<Vec<_>>();
+        let digits = (0..100).collect::<Vec<_>>();
         let tail = vec![0, 1];
         let shifted_digits = digits
             .clone()
@@ -395,5 +398,80 @@ mod tests {
             .collect();
         assert!(hashes.len() > 1);
         assert_eq!(hashes.into_iter().collect::<HashSet<_>>().len(), 1);
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        #[derive(Debug)]
+        struct Case<'a> {
+            old: &'a [u8],
+            new: Vec<u8>,
+            desc: &'a str,
+        }
+        const W: usize = WINDOW_SIZE;
+        let rep = b"abcdefghij";
+        let mut repeated = Vec::new();
+        for _ in 0..5 {
+            repeated.extend_from_slice(rep);
+        }
+        let cases = vec![
+            Case {
+                old: b"abcdefghij12345abcdefghij",
+                new: b"abcdefghij12345abcdefghij".to_vec(),
+                desc: "long matching block",
+            },
+            {
+                let mut v = b"abcdefghij12345abcdefghij".to_vec();
+                v.insert(W + 2, b'X');
+                Case {
+                    old: b"abcdefghij12345abcdefghij",
+                    new: v,
+                    desc: "insertion inside long block",
+                }
+            },
+            {
+                let mut v = b"abcdefghij12345abcdefghij".to_vec();
+                v.remove(W + 2);
+                Case {
+                    old: b"abcdefghij12345abcdefghij",
+                    new: v,
+                    desc: "deletion inside long block",
+                }
+            },
+            {
+                let mut v = b"abcdefghij12345abcdefghij".to_vec();
+                v[W + 2] = b'Z';
+                Case {
+                    old: b"abcdefghij12345abcdefghij",
+                    new: v,
+                    desc: "replacement inside long block",
+                }
+            },
+            Case {
+                old: &repeated,
+                new: repeated.clone(),
+                desc: "repeated windows > WINDOW_SIZE",
+            },
+            Case {
+                old: b"abcdefghij12345",
+                new: b"ZZZabcdefghij12345".to_vec(),
+                desc: "Add at start, Copy after window",
+            },
+            Case {
+                old: b"abcdefghij12345",
+                new: b"abcdefghij12345YYY".to_vec(),
+                desc: "Add at end, Copy at start",
+            },
+            Case {
+                old: b"abcdefghij12345abcdefghij",
+                new: b"abcdefghij12345Xabcdefghij".to_vec(),
+                desc: "Add at window boundary",
+            },
+        ];
+        for case in cases {
+            let patch = make_diff(case.old, &case.new);
+            let patched = apply_patch(case.old, &patch).unwrap();
+            assert_eq!(&patched, &case.new, "failed: {}", case.desc);
+        }
     }
 }
