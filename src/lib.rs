@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn test_patches() {
-        let digits = (0..100).into_iter().collect::<Vec<_>>();
+        let digits = (0..100).collect::<Vec<_>>();
         let tail = vec![0, 1];
         let shifted_digits = digits
             .clone()
@@ -398,5 +398,80 @@ mod tests {
             .collect();
         assert!(hashes.len() > 1);
         assert_eq!(hashes.into_iter().collect::<HashSet<_>>().len(), 1);
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        #[derive(Debug)]
+        struct Case<'a> {
+            old: &'a [u8],
+            new: Vec<u8>,
+            desc: &'a str,
+        }
+        const W: usize = WINDOW_SIZE;
+        let rep = b"abcdefghij";
+        let mut repeated = Vec::new();
+        for _ in 0..5 {
+            repeated.extend_from_slice(rep);
+        }
+        let cases = vec![
+            Case {
+                old: b"abcdefghij12345abcdefghij",
+                new: b"abcdefghij12345abcdefghij".to_vec(),
+                desc: "long matching block",
+            },
+            {
+                let mut v = b"abcdefghij12345abcdefghij".to_vec();
+                v.insert(W + 2, b'X');
+                Case {
+                    old: b"abcdefghij12345abcdefghij",
+                    new: v,
+                    desc: "insertion inside long block",
+                }
+            },
+            {
+                let mut v = b"abcdefghij12345abcdefghij".to_vec();
+                v.remove(W + 2);
+                Case {
+                    old: b"abcdefghij12345abcdefghij",
+                    new: v,
+                    desc: "deletion inside long block",
+                }
+            },
+            {
+                let mut v = b"abcdefghij12345abcdefghij".to_vec();
+                v[W + 2] = b'Z';
+                Case {
+                    old: b"abcdefghij12345abcdefghij",
+                    new: v,
+                    desc: "replacement inside long block",
+                }
+            },
+            Case {
+                old: &repeated,
+                new: repeated.clone(),
+                desc: "repeated windows > WINDOW_SIZE",
+            },
+            Case {
+                old: b"abcdefghij12345",
+                new: b"ZZZabcdefghij12345".to_vec(),
+                desc: "Add at start, Copy after window",
+            },
+            Case {
+                old: b"abcdefghij12345",
+                new: b"abcdefghij12345YYY".to_vec(),
+                desc: "Add at end, Copy at start",
+            },
+            Case {
+                old: b"abcdefghij12345abcdefghij",
+                new: b"abcdefghij12345Xabcdefghij".to_vec(),
+                desc: "Add at window boundary",
+            },
+        ];
+        for case in cases {
+            let patch = make_diff(case.old, &case.new);
+            let patched = apply_patch(case.old, &patch).unwrap();
+            assert_eq!(&patched, &case.new, "failed: {}", case.desc);
+        }
     }
 }
