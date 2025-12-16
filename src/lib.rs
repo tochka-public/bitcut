@@ -194,6 +194,7 @@ fn simd_memcmp(a: &[u8], b: &[u8]) -> usize {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 #[inline]
 unsafe fn simd_memcmp_avx2(a: &[u8], b: &[u8]) -> usize {
     use std::arch::x86_64::*;
@@ -222,6 +223,7 @@ unsafe fn simd_memcmp_avx2(a: &[u8], b: &[u8]) -> usize {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 #[inline]
 unsafe fn simd_memcmp_neon(a: &[u8], b: &[u8]) -> usize {
     use std::arch::aarch64::*;
