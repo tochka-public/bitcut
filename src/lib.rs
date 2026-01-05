@@ -331,6 +331,7 @@ impl<'a> Iterator for RollingHash<'a> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
     use std::collections::HashSet;
 
     use super::*;
@@ -475,5 +476,27 @@ mod tests {
             let patched = apply_patch(case.old, &patch).unwrap();
             assert_eq!(&patched, &case.new, "failed: {}", case.desc);
         }
+    }
+
+    #[rstest]
+    #[case(&[] as &[u8], &[], 0)]
+    #[case(b"Hello, world!", b"", 0)]
+    #[case(b"", b"Hello, world!", 0)]
+    #[case(b"Hello, world!", b"Hello, world!", 13)]
+    #[case(b"abc", b"xbc", 0)]
+    #[case(b"abc", b"axc", 1)]
+    #[case(b"abc", b"abd", 2)]
+    #[case(b"abcdef", b"abc", 3)]
+    #[case(&vec![0u8; 1000][..], &vec![0u8; 1000][..], 1000)]
+    fn test_simd_memcmp(#[case] a: &[u8], #[case] b: &[u8], #[case] expected: usize) {
+        assert_eq!(simd_memcmp(a, b), expected);
+    }
+
+    #[test]
+    fn test_simd_memcmp_large_diff() {
+        let a = vec![0u8; 1000];
+        let mut b = vec![0u8; 1000];
+        b[500] = 1;
+        assert_eq!(simd_memcmp(&a, &b), 500);
     }
 }
