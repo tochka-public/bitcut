@@ -207,10 +207,10 @@ unsafe fn simd_memcmp_avx2(a: &[u8], b: &[u8]) -> usize {
         let chunk_a = _mm256_loadu_si256(pa.add(i) as *const __m256i);
         let chunk_b = _mm256_loadu_si256(pb.add(i) as *const __m256i);
         let cmp = _mm256_cmpeq_epi8(chunk_a, chunk_b);
-        let mask = _mm256_movemask_epi8(cmp);
-        if mask != -1 {
-            let diff_index = (!mask as u32).trailing_zeros() as usize;
-            return i + diff_index;
+        let mask = _mm256_movemask_epi8(cmp) as u32;
+        if mask != 0xFFFF_FFFF {
+            let diff_index = _tzcnt_u32(!mask);
+            return i + diff_index as usize;
         }
         i += 32;
     }
