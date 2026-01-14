@@ -198,6 +198,7 @@ fn simd_memcmp(a: &[u8], b: &[u8]) -> usize {
 #[inline]
 unsafe fn simd_memcmp_avx2(a: &[u8], b: &[u8]) -> usize {
     use std::arch::x86_64::*;
+
     let len = a.len().min(b.len());
     let mut i = 0;
     let pa = a.as_ptr();
@@ -208,9 +209,11 @@ unsafe fn simd_memcmp_avx2(a: &[u8], b: &[u8]) -> usize {
         let chunk_b = _mm256_loadu_si256(pb.add(i) as *const __m256i);
         let cmp = _mm256_cmpeq_epi8(chunk_a, chunk_b);
         let mask = _mm256_movemask_epi8(cmp) as u32;
-        if mask != 0xFFFF_FFFF {
-            let diff_index = _tzcnt_u32(!mask);
-            return i + diff_index as usize;
+
+        if mask != 0xFFFFFFFF {
+            let inverted = !mask;
+            let diff_index = inverted.trailing_zeros() as usize;
+            return i + diff_index;
         }
         i += 32;
     }
@@ -487,6 +490,16 @@ mod tests {
     #[case(b"abc", b"axc", 1)]
     #[case(b"abc", b"abd", 2)]
     #[case(b"abcdef", b"abc", 3)]
+    #[case(
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        32
+    )]
+    #[case(
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        31
+    )]
     #[case(&vec![0u8; 1000][..], &vec![0u8; 1000][..], 1000)]
     fn test_simd_memcmp(#[case] a: &[u8], #[case] b: &[u8], #[case] expected: usize) {
         assert_eq!(simd_memcmp(a, b), expected);
