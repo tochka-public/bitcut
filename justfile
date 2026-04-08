@@ -1,35 +1,29 @@
-default: lint fmt test
+default: check test
 
 set dotenv-load
 export RUST_BACKTRACE := "1"
 
-lint:
-  cargo clippy -q
-
+# apply formatting
 fmt:
-  cargo fmt -q
+  cargo fmt --all
 
-check: lint fmt
+# read-only format check
+fmt-check:
+  cargo fmt --all -- --check
+
+clippy:
+  cargo clippy --all-targets --all-features -- -D warnings
+  cargo clippy --all-targets --no-default-features -- -D warnings
+
+check: fmt-check clippy
 
 test:
-  cargo test -q
+  cargo test --all-features
+  cargo test --no-default-features
+
+# reproduce CI locally
+ci: check test
 
 alias t := test
-alias l := lint
 alias f := fmt
-
-publish:
-  test "$(git rev-parse --abbrev-ref HEAD)" = "master"
-  git diff --quiet
-  git diff --cached --quiet
-  git fetch
-  test "$(git rev-parse @{u})" = "$(git rev-parse HEAD)"
-
-  old_version="$(git show HEAD^:Cargo.toml | grep '^version =' | head -n1 | cut -d '"' -f2)"
-  new_version="$(grep '^version =' Cargo.toml | head -n1 | cut -d '"' -f2)"
-  test "$old_version" != "$new_version"
-
-  latest="$(curl -s https://crates.io/api/v1/crates/my_crate | jq -r '.crate.max_version')"
-  test "$new_version" != "$latest"
-
-  cargo publish --dry-run
+alias c := check

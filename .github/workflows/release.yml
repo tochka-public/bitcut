@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  publish:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(grep -m1 '^version =' Cargo.toml | cut -d '"' -f2)"
+          if [ "$tag" != "$manifest" ]; then
+            echo "tag v$tag does not match Cargo.toml version $manifest" >&2
+            exit 1
+          fi
+
+      - name: verify tag is on master
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin master
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "tag commit $GITHUB_SHA is not reachable from origin/master" >&2
+            exit 1
+          fi
+
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish
