@@ -1,0 +1,9 @@
+---
+source: src/lib.rs
+expression: ops
+---
+[
+    Add(
+        Text("\u{1}\u{2}\u{3}"),
+    ),
+]

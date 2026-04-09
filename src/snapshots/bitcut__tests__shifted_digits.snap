@@ -1,0 +1,13 @@
+---
+source: src/lib.rs
+expression: ops
+---
+[
+    Copy(
+        2,
+        98,
+    ),
+    Add(
+        Text("\0\u{1}"),
+    ),
+]

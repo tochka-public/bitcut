@@ -1,0 +1,17 @@
+---
+source: src/lib.rs
+expression: ops
+---
+[
+    Copy(
+        0,
+        15,
+    ),
+    Add(
+        Text("X"),
+    ),
+    Copy(
+        0,
+        10,
+    ),
+]

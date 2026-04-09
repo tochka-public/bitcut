@@ -1,0 +1,16 @@
+---
+source: src/lib.rs
+expression: collected
+---
+[
+    Ok(
+        Add(
+            Text("hi"),
+        ),
+    ),
+    Err(
+        InvalidOpcode(
+            238,
+        ),
+    ),
+]

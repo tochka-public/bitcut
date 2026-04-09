@@ -1,0 +1,9 @@
+---
+source: src/lib.rs
+expression: err
+---
+CopyOutOfBounds {
+    offset: 0,
+    len: 100,
+    old_len: 5,
+}

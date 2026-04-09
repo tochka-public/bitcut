@@ -1,0 +1,17 @@
+---
+source: src/lib.rs
+expression: ops
+---
+[
+    Copy(
+        10,
+        11,
+    ),
+    Copy(
+        0,
+        10,
+    ),
+    Add(
+        Text("baz"),
+    ),
+]
