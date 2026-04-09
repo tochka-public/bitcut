@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
 };
 
-use bitcut::{apply_patch, make_diff, Op};
+use bitcut::{apply_patch, make_patch, Op};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -19,9 +19,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Create binary patch from two files and write to stdout
+    /// Create a binary patch from two files and write it to stdout
     Diff { old: PathBuf, new: PathBuf },
-    /// Apply binary patch to a file and write result to stdout
+    /// Apply a binary patch to a file and write the result to stdout
     Patch { old: PathBuf, patch: PathBuf },
     /// Print patch opcodes
     Debug { patch: PathBuf },
@@ -34,21 +34,19 @@ fn main() -> anyhow::Result<()> {
         Commands::Diff { old, new } => {
             let old = fs::read(old)?;
             let new = fs::read(new)?;
-            let patch = make_diff(&old, &new);
+            let patch = make_patch(&old, &new)?;
             stdout().write_all(&patch)?;
         }
         Commands::Patch { old, patch } => {
             let old = fs::read(old)?;
             let patch = fs::read(patch)?;
-            let new = apply_patch(&old, &patch).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let new = apply_patch(&old, &patch)?;
             stdout().write_all(&new)?;
         }
         Commands::Debug { patch } => {
             let patch = fs::read(patch)?;
-            println!(
-                "{:#?}",
-                Op::deserialize_all(&patch).map_err(|e| anyhow::anyhow!("{e}"))?
-            );
+            let ops: Vec<_> = Op::iter(&patch).collect::<Result<_, _>>()?;
+            println!("{ops:#?}");
         }
     }
 

@@ -1,0 +1,9 @@
+---
+source: src/lib.rs
+expression: ops
+---
+[
+    Add(
+        Text(""),
+    ),
+]
