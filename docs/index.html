@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bitcut — the diff algorithm, step by step</title>
+<meta name="description" content="An interactive, step-by-step walkthrough of the tiered resync differ used by bitcut.">
+<style>
+:root{
+  --ink:#16181d; --muted:#6b7280; --line:#dde1e8; --paper:#f7f8fa; --card:#fff;
+  --grey:#e6eaf0; --blue:#1d6feb; --green:#0f7b46; --red:#c2410c;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);
+     font:400 17px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
+     -webkit-font-smoothing:antialiased}
+.wrap{max-width:1180px;margin:0 auto;padding:32px 20px 80px}
+h1{font-size:40px;line-height:1.05;letter-spacing:-.03em;margin:0 0 6px}
+.lede{font-size:19px;color:var(--muted);margin:0 0 22px}
+.lede a{color:var(--ink)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:22px;margin:0 0 18px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+button{font:inherit;border:1px solid var(--line);background:#fff;color:var(--ink);
+       border-radius:12px;padding:9px 16px;cursor:pointer}
+button:hover{background:#f0f3f8}
+button:disabled{opacity:.4;cursor:default}
+button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+button.big{font-size:19px;padding:12px 22px;font-weight:600}
+
+/* strips */
+.strip{margin:14px 0 4px}
+.striplab{font-size:13px;letter-spacing:.08em;color:var(--muted);margin-bottom:5px}
+.cells{display:flex;overflow-x:auto;padding-bottom:6px}
+.c{flex:0 0 auto;width:13px;height:30px;line-height:30px;text-align:center;
+   font:600 12px/30px ui-monospace,SFMono-Regular,Menlo,monospace;
+   background:var(--grey);color:#8a92a0;border-right:1px solid #fff;position:relative;
+   white-space:pre}
+.c.src,.c.doneCopy{background:#cfe0fb;color:#2b4a75}
+.c.doneAdd{background:#ffe6b0;color:#7a5a12}
+.c.run{background:var(--blue);color:#fff}
+.c.mismatch{background:var(--red);color:#fff}
+.c.win{box-shadow:inset 0 -4px 0 #b9d3fb}
+.c.gapzone{background:#f0d9a8;color:#7a5a12}
+.c.anchor{background:#0b3c8f;color:#fff}
+.c.cand{outline:2px solid #94a3b8;outline-offset:-2px;z-index:1}
+.c.bad{background:var(--red);color:#fff}
+.c.good{background:var(--green);color:#fff}
+.c.ext{box-shadow:inset 0 -4px 0 var(--green)}
+.c.skipzone{background:#ffd28a;color:#7a5a12}
+.c.cur{box-shadow:inset 3px 0 0 var(--ink)}
+.c.cur::after{content:'▲';position:absolute;left:-2px;top:30px;font-size:11px;color:var(--ink)}
+
+/* legend */
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:14px;color:var(--muted);margin-top:20px}
+.legend span{display:flex;align-items:center;gap:7px}
+.sw{width:15px;height:15px;border-radius:4px;display:inline-block}
+
+/* narration */
+.narr{background:#fff;border:1px solid var(--line);border-radius:20px;padding:24px;min-height:138px}
+.chip{display:inline-block;font-size:12px;font-weight:700;letter-spacing:.07em;
+      border-radius:999px;padding:4px 12px;background:#eef2f8;color:#41506b;margin-bottom:10px}
+.chip.ok{background:#d9f0e3;color:#0f5c36}
+.chip.no{background:#fbe1d6;color:#8a2f0b}
+.narr h3{margin:0 0 6px;font-size:24px;line-height:1.25}
+.narr p{margin:0;font-size:18px;color:#3d4550}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+
+.grid{display:grid;grid-template-columns:1.35fr .8fr .85fr;gap:16px}
+@media(max-width:900px){.grid{grid-template-columns:1fr}h1{font-size:32px}}
+.mini h4{margin:0 0 10px;font-size:13px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase}
+.ops{font-family:ui-monospace,Menlo,monospace;font-size:14px;line-height:1.9;max-height:190px;overflow:auto}
+.ops span{display:inline-block;border-radius:8px;padding:2px 9px;margin:0 5px 5px 0}
+.ops .cp{background:#cfe0fb;color:#1b3f6b}
+.ops .ad{background:#ffe6b0;color:#7a5a12}
+.slots{display:flex;gap:7px;flex-wrap:wrap}
+.slots i{font-style:normal;font-family:ui-monospace,Menlo,monospace;font-size:14px;
+         background:#eef2f8;border:1px solid var(--line);border-radius:10px;padding:5px 11px}
+.slots i.zero{background:var(--ink);color:#fff;border-color:var(--ink)}
+.slots i.hot{background:#d9f0e3;border-color:#8fd0ae;color:#0f5c36}
+.stats{font-size:15px}
+.stats div{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px dashed #e8ebf0}
+.stats b{font-variant-numeric:tabular-nums}
+
+input[type=range]{width:100%;accent-color:#16181d}
+.pos{font-variant-numeric:tabular-nums;color:var(--muted);font-size:15px;min-width:96px;text-align:center}
+table.k{width:100%;border-collapse:collapse;font-size:15px}
+table.k td,table.k th{padding:8px 6px;border-bottom:1px solid var(--line);text-align:left}
+table.k th{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.note{font-size:15px;color:var(--muted)}
+footer{margin-top:34px;font-size:15px;color:var(--muted);text-align:center}
+footer a{color:var(--ink)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>The diff algorithm, step by step</h1>
+<p class="lede">How <a href="https://github.com/tochka-public/bitcut">bitcut</a> finds the difference between two
+documents without ever indexing either of them.</p>
+
+<div class="card">
+  <div class="row">
+    <b style="margin-right:6px">Example:</b>
+    <button id="ex0" class="on">Ordinary edits</button>
+    <button id="ex1">Sections swapped</button>
+    <span class="note" style="margin-left:auto">Arrow keys work too</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="strip">
+    <div class="striplab">OLD DOCUMENT &nbsp;<span class="note" id="oldlen"></span></div>
+    <div class="cells" id="old"></div>
+  </div>
+  <div class="strip" style="margin-top:22px">
+    <div class="striplab">NEW DOCUMENT &nbsp;<span class="note" id="newlen"></span></div>
+    <div class="cells" id="new"></div>
+  </div>
+  <div class="legend">
+    <span><i class="sw" style="background:#e6eaf0"></i> untouched</span>
+    <span><i class="sw" style="background:#cfe0fb"></i> emitted as a copy</span>
+    <span><i class="sw" style="background:#ffe6b0"></i> emitted as a literal</span>
+    <span><i class="sw" style="background:#1d6feb"></i> run being compared</span>
+    <span><i class="sw" style="background:#0b3c8f"></i> anchor</span>
+    <span><i class="sw" style="background:#0f7b46"></i> accepted</span>
+    <span><i class="sw" style="background:#c2410c"></i> rejected / mismatch</span>
+    <span>▲ cursor</span>
+  </div>
+</div>
+
+<div class="narr" id="narr"></div>
+
+<div class="card" style="margin-top:18px">
+  <div class="row" style="justify-content:center">
+    <button id="first" title="Back to the start">⏮</button>
+    <button id="prev" class="big">← Back</button>
+    <span class="pos" id="pos"></span>
+    <button id="next" class="big">Next →</button>
+    <button id="jump">▶︎ Skip to next event</button>
+    <button id="play">Autoplay</button>
+  </div>
+  <input type="range" id="scrub" min="0" value="0" style="margin-top:14px">
+  <p class="note" style="margin:12px 0 0;text-align:center">
+    <span class="mono">←</span> <span class="mono">→</span> step ·
+    <span class="mono">space</span> skip to the next event
+  </p>
+</div>
+
+<div class="grid">
+  <div class="card mini">
+    <h4>Patch built so far</h4>
+    <div class="ops" id="ops"></div>
+  </div>
+  <div class="card mini">
+    <h4>Drift cache</h4>
+    <div class="slots" id="slots"></div>
+    <p class="note" style="margin-top:12px">Drift 0 is always tried first. The rest, most recent first.</p>
+  </div>
+  <div class="card mini">
+    <h4>Counters</h4>
+    <div class="stats" id="stats"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h4 style="margin:0 0 10px;font-size:13px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase">Constants</h4>
+  <table class="k">
+    <tr><th>Name</th><th>Here</th><th>In the crate</th><th>What it decides</th></tr>
+    <tr><td class="mono">MIN_MATCH</td><td class="mono">6</td><td class="mono">16</td><td>below this, a copy costs more than the literal it replaces</td></tr>
+    <tr><td class="mono">ANCHOR</td><td class="mono">6</td><td class="mono">32</td><td>length of the fragment searched for</td></tr>
+    <tr><td class="mono">VERIFY</td><td class="mono">14</td><td class="mono">64</td><td>how far a match must extend to be believed</td></tr>
+    <tr><td class="mono">GAPS</td><td class="mono">0, 2, 6, 8</td><td class="mono">0, 32, 128, 512, 2048</td><td>offsets the anchor is taken from</td></tr>
+    <tr><td class="mono">WINDOW</td><td class="mono">±16</td><td class="mono">±4096</td><td>half-width of the search window in the old document</td></tr>
+    <tr><td class="mono">SKIP</td><td class="mono">8</td><td class="mono">2048</td><td>= the widest gap, always</td></tr>
+    <tr><td class="mono">SLOTS</td><td class="mono">4</td><td class="mono">16</td><td>how many drifts are remembered</td></tr>
+  </table>
+  <p class="note" style="margin-top:14px">The constants are scaled down so the steps are visible on a 70-byte
+  document. The threshold for building the global index is relaxed here too (3× the size of the base). The real
+  rule is stricter: the index is built as soon as <i>one more round</i> of local searching would cost as much as
+  indexing the base outright — which, on 70 bytes, is immediately, because indexing 70 bytes is free.</p>
+</div>
+
+<footer>
+  <a href="https://github.com/tochka-public/bitcut">github.com/tochka-public/bitcut</a>
+</footer>
+
+</div>
+
+<script>
+// ===========================================================================
+// A line-by-line port of src/differ.rs, recording every micro-step.
+// ===========================================================================
+function simulate(OLD, NEW, K) {
+  const ev = [], chunks = [], shifts = [];
+  let i = 0, j = 0, scanned = 0, index = null;
+  const st = { copies:0, literals:0, resyncs:0, hits:0, searches:0, escalations:0 };
+  const snap = (o) => ev.push(Object.assign({
+    i, j, chunks: chunks.map(c => ({...c})), shifts: [...shifts], scanned,
+    stats: {...st}
+  }, o));
+  const prefixLen = (ni, oj) => { let n=0;
+    while (ni+n < NEW.length && oj+n < OLD.length && NEW[ni+n] === OLD[oj+n]) n++; return n; };
+  const record = (d) => { if (d === 0) return;
+    const at = shifts.indexOf(d); if (at !== -1) shifts.splice(at,1);
+    shifts.unshift(d); if (shifts.length > K.SLOTS) shifts.length = K.SLOTS; };
+  const pushLiteral = (start, len) => { if (!len) return;
+    const last = chunks[chunks.length-1];
+    if (last && last.k === 'add' && last.start + last.len === start) { last.len += len; return; }
+    chunks.push({k:'add', start, len}); st.literals++; };
+  const probe = (gap) => { const atNew = i + gap;
+    if (atNew + K.ANCHOR > NEW.length) return null;
+    return { gap, atNew, atOld: Math.min(j+gap, OLD.length),
+             anchor: NEW.slice(atNew, atNew+K.ANCHOR),
+             need: Math.min(K.VERIFY, NEW.length - atNew) }; };
+  const alignBack = (gap, pos) => { let literal = gap, aligned = pos, steps = 0;
+    while (literal > 0 && aligned > 0 && NEW[i+literal-1] === OLD[aligned-1]) { literal--; aligned--; steps++; }
+    return { literal, aligned, steps }; };
+  const buildIndex = () => { const m = new Map();
+    for (let p = 0; p + K.INDEXW <= OLD.length; p++) { const g = OLD.slice(p, p+K.INDEXW);
+      if (!m.has(g)) m.set(g, p); } return m; };
+  const escalate = () => { st.escalations++;
+    if (!index) { index = buildIndex(); snap({t:'index-build', size:index.size}); }
+    for (let k = 0; i+k+K.INDEXW <= NEW.length; k++) {
+      const g = NEW.slice(i+k, i+k+K.INDEXW), pos = index.get(g);
+      if (pos === undefined) continue;
+      const ext = prefixLen(i+k, pos), ok = ext >= K.MIN_MATCH;
+      snap({t:'index-try', k, gram:g, pos, ext, ok});
+      if (ok) return { literal:k, aligned:pos }; }
+    snap({t:'index-none'}); return null; };
+
+  const resync = () => {
+    for (const gap of K.GAPS) {
+      const p = probe(gap);
+      if (!p) { snap({t:'probe-skip', gap}); continue; }
+      snap({t:'tier1-gap', p});
+      for (const d of [0, ...shifts]) {
+        const pos = p.atOld + d;
+        if (pos < 0 || pos > OLD.length) { snap({t:'tier1-try', p, d, pos, oob:true, ok:false}); continue; }
+        const ext = prefixLen(p.atNew, pos), ok = ext >= p.need;
+        snap({t:'tier1-try', p, d, pos, ext, ok});
+        if (ok) { st.hits++; const a = alignBack(gap, pos);
+          snap({t:'accept', via:'cache', p, d, pos, ext, back:a}); return a; } } }
+    for (const gap of K.GAPS) {
+      const p = probe(gap); if (!p) continue;
+      const lo = Math.max(0, p.atOld - K.WINDOW);
+      const hi = Math.min(OLD.length, p.atOld + K.WINDOW + K.ANCHOR);
+      const hay = OLD.slice(lo, hi), found = [];
+      let at = hay.indexOf(p.anchor);
+      while (at !== -1) { found.push(lo+at); at = hay.indexOf(p.anchor, at+1); }
+      st.searches++;
+      snap({t:'tier2-search', p, lo, hi, found});
+      let accepted = null;
+      for (const pos of found) {
+        const ext = prefixLen(p.atNew, pos), ok = ext >= p.need;
+        snap({t:'tier2-try', p, pos, ext, ok, lo, hi, found});
+        if (ok) { accepted = pos; break; } }
+      scanned += accepted === null ? hay.length : (accepted - lo) + K.ANCHOR;
+      if (accepted !== null) { const d = accepted - p.atOld; record(d);
+        const a = alignBack(gap, accepted);
+        snap({t:'accept', via:'window', p, d, pos:accepted, back:a}); return a; } }
+    snap({t:'resync-fail'}); return null; };
+
+  snap({t:'start'});
+  while (i < NEW.length) {
+    const run = prefixLen(i, j);
+    snap({t:'extend', run, ok: run >= K.MIN_MATCH});
+    if (run >= K.MIN_MATCH) {
+      chunks.push({k:'copy', offset:j, len:run}); st.copies++;
+      snap({t:'emit-copy', offset:j, len:run});
+      i += run; j += run;
+      if (i >= NEW.length) break;
+      snap({t:'extend-again'}); continue; }
+    st.resyncs++; snap({t:'resync-open'});
+    const found = resync();
+    if (found && (found.literal > 0 || found.aligned !== j)) {
+      pushLiteral(i, found.literal);
+      snap({t:'emit-add', start:i, len:found.literal, aligned:found.aligned});
+      i += found.literal; j = found.aligned; continue; }
+    const budget = scanned >= K.ESCALATE_AT;
+    snap({t:'ladder', budget, scanned, at:K.ESCALATE_AT, hasIndex: !!index});
+    if (index || budget) {
+      const e = escalate();
+      if (e && (e.literal > 0 || e.aligned !== j)) {
+        pushLiteral(i, e.literal);
+        snap({t:'emit-add', start:i, len:e.literal, aligned:e.aligned});
+        i += e.literal; j = e.aligned; continue; }
+      pushLiteral(i, NEW.length - i); snap({t:'finish', reason:'index-none'}); break; }
+    const remaining = NEW.length - i;
+    if (remaining <= K.SKIP) { pushLiteral(i, remaining); snap({t:'finish', reason:'short-tail'}); break; }
+    pushLiteral(i, K.SKIP); snap({t:'skip', len:K.SKIP}); i += K.SKIP; }
+  snap({t:'done'});
+  return ev;
+}
+
+// ===========================================================================
+const K = { MIN_MATCH:6, ANCHOR:6, VERIFY:14, GAPS:[0,2,6,8], SKIP:8, WINDOW:16, SLOTS:4, INDEXW:4 };
+
+const EXAMPLES = [
+  { name:'Ordinary edits',
+    old:"cp:Acme,Borg,Cyan|01.03 pay 10|01.03 fee 20|01.03 pay 30|01.03 fee 40",
+    new:"cp:Acme,Beta,Borg,Cyan|01.03 payed 10|01.03 fee 20|01.03 payed 30|01.03 fee 40|01.03 fee 50" },
+  { name:'Sections swapped',
+    old:"cp:Acme,Borg,Cyan|01.03 done|02.03 done" + "|09.09 audit|10.09 audit|11.09 audit",
+    new:"|09.09 audit|10.09 audit|11.09 audit" + "cp:Acme,Borg,Cyan|01.03 done|02.03 done" },
+];
+
+let EX = 0, OLD, NEW, FR = [], at = 0, timer = null;
+
+const $ = (id) => document.getElementById(id);
+const esc = (ch) => ch === ' ' ? '␣' : ch;
+
+function load(n) {
+  EX = n; OLD = EXAMPLES[n].old; NEW = EXAMPLES[n].new;
+  FR = simulate(OLD, NEW, { ...K, ESCALATE_AT: 3 * OLD.length });
+  $('old').innerHTML = [...OLD].map((c,x)=>`<span class="c" data-x="${x}">${esc(c)}</span>`).join('');
+  $('new').innerHTML = [...NEW].map((c,x)=>`<span class="c" data-x="${x}">${esc(c)}</span>`).join('');
+  $('oldlen').textContent = OLD.length + ' bytes';
+  $('newlen').textContent = NEW.length + ' bytes';
+  $('scrub').max = FR.length - 1;
+  $('ex0').className = n === 0 ? 'on' : '';
+  $('ex1').className = n === 1 ? 'on' : '';
+  go(0);
+}
+
+const oldCells = () => $('old').children;
+const newCells = () => $('new').children;
+function mark(cells, from, len, cls) {
+  for (let x = from; x < from + len; x++) { const c = cells[x]; if (c) c.classList.add(cls); }
+}
+
+function paint(f) {
+  for (const c of oldCells()) c.className = 'c';
+  for (const c of newCells()) c.className = 'c';
+  const O = oldCells(), N = newCells();
+
+  let out = 0;
+  for (const c of f.chunks) {
+    if (c.k === 'copy') { mark(N, out, c.len, 'doneCopy'); mark(O, c.offset, c.len, 'src'); }
+    else mark(N, out, c.len, 'doneAdd');
+    out += c.len;
+  }
+
+  const p = f.p;
+  if (p) { mark(N, f.i, p.gap, 'gapzone'); mark(N, p.atNew, K.ANCHOR, 'anchor'); }
+
+  switch (f.t) {
+    case 'extend':
+      mark(N, f.i, f.run, 'run'); mark(O, f.j, f.run, 'run');
+      if (f.run === 0 || !f.ok) { mark(N, f.i + f.run, 1, 'mismatch'); mark(O, f.j + f.run, 1, 'mismatch'); }
+      break;
+    case 'tier1-try':
+      if (!f.oob) { mark(O, f.pos, K.ANCHOR, f.ok ? 'good' : 'bad'); mark(O, f.pos, f.ext, 'ext'); }
+      break;
+    case 'tier2-search':
+      mark(O, f.lo, f.hi - f.lo, 'win');
+      for (const q of f.found) mark(O, q, K.ANCHOR, 'cand');
+      break;
+    case 'tier2-try':
+      mark(O, f.lo, f.hi - f.lo, 'win');
+      for (const q of f.found) mark(O, q, K.ANCHOR, 'cand');
+      mark(O, f.pos, K.ANCHOR, f.ok ? 'good' : 'bad'); mark(O, f.pos, f.ext, 'ext');
+      break;
+    case 'accept':
+      mark(O, f.pos, K.ANCHOR, 'good');
+      mark(N, f.i, f.back.literal, 'skipzone');
+      break;
+    case 'emit-add':
+      mark(N, f.start, f.len, 'doneAdd');
+      break;
+    case 'skip':
+      mark(N, f.i, f.len, 'skipzone');
+      break;
+    case 'index-try':
+      mark(O, f.pos, K.INDEXW, f.ok ? 'good' : 'bad'); mark(O, f.pos, f.ext, 'ext');
+      mark(N, f.i + f.k, K.INDEXW, 'anchor');
+      break;
+  }
+
+  if (N[f.i]) N[f.i].classList.add('cur');
+  if (O[f.j]) O[f.j].classList.add('cur');
+}
+
+const q = (s) => `<span class="mono">“${s.replace(/ /g,'␣')}”</span>`;
+
+function narrate(f) {
+  const P = f.p;
+  switch (f.t) {
+    case 'start': return ['START','Both cursors at zero',
+      'The old document is on top, the new one below. The black triangle marks where each cursor sits.'];
+    case 'extend': return f.ok
+      ? ['COMPARE','' + f.run + ' bytes match',
+         'That is at least MIN_MATCH (' + K.MIN_MATCH + '), so a copy pays for itself: one opcode instead of ' + f.run + ' literal bytes.']
+      : ['COMPARE', f.run === 0 ? 'The bytes differ immediately' : 'Only ' + f.run + ' bytes match',
+         'The red cell is where they diverge. ' + (f.run === 0 ? '' : 'That is below MIN_MATCH (' + K.MIN_MATCH + '), so a copy would cost more than it saves. ') + 'Now find where the two documents line up again.'];
+    case 'emit-copy': return ['EMIT','Copy(' + f.offset + ', ' + f.len + ')',
+      'Write “copy ' + f.len + ' bytes from offset ' + f.offset + '”. Both cursors jump forward by ' + f.len + '.'];
+    case 'extend-again': return ['CONTINUE','Comparing again from the new position',''];
+    case 'resync-open': return ['RESYNC','Find where the old document continues',
+      'Tier 1 is the remembered drifts. That is not a search — it is checking a hypothesis you already have, which is nearly free.'];
+    case 'probe-skip': return ['GAP SKIPPED','Gap ' + f.gap + ' does not fit',
+      'Fewer than ' + K.ANCHOR + ' bytes are left in the new document, so there is nothing to take an anchor from.'];
+    case 'tier1-gap': return ['GAP ' + P.gap, 'Anchor ' + q(P.anchor),
+      'Take ' + K.ANCHOR + ' bytes from the new document, ' + P.gap + ' bytes past the divergence. '
+      + (P.gap === 0 ? 'Gap 0 means right at the divergence point.' : 'The gap exists to step over the newly written bytes — those are not in the old document at all.')
+      + ' To be believed, the match must extend ' + P.need + ' bytes.'];
+    case 'tier1-try':
+      if (f.oob) return ['DRIFT ' + f.d, 'Outside the document', 'That position does not exist in the old document. Skip it.'];
+      return [(f.ok ? 'HIT' : 'MISS'),
+        (f.d === 0 ? 'Drift 0' : 'Remembered drift ' + f.d) + ' → position ' + f.pos,
+        (f.d === 0 ? 'Drift 0 is an edit that changed no length. It is always tried first. ' : 'This drift has already come up in this document. ')
+        + 'Matched ' + f.ext + ' of the ' + P.need + ' required. ' + (f.ok ? 'Believed.' : 'Not far enough — rejected.')];
+    case 'tier2-search': return ['WINDOW', f.found.length
+        ? 'Found ' + f.found.length + ' occurrence' + (f.found.length === 1 ? '' : 's') + ': ' + f.found.join(', ')
+        : 'Anchor ' + q(P.anchor) + ' is not in the window',
+      'Tier 2: search the old document for the anchor, but only inside [' + f.lo + ', ' + f.hi + ') — ±' + K.WINDOW
+      + ' around the expected position ' + P.atOld + '. The whole document is never scanned.'];
+    case 'tier2-try': return [(f.ok ? 'VERIFIED' : 'FALSE FRIEND'),
+      'Candidate at ' + f.pos + ': extends ' + f.ext + ' of ' + P.need,
+      f.ok ? 'The match continues far enough. Accepted.'
+           : 'The anchor matched, but the bytes after it do not. Fragments like this repeat all over a real document — without this check the differ would align to the wrong place and dump the entire remainder into one huge literal.'];
+    case 'accept': {
+      const head = f.via === 'cache' ? 'HIT, NO SEARCH' : 'ALIGNMENT FOUND';
+      const t = f.via === 'cache'
+        ? 'The drift cache answered it: drift ' + f.d
+        : 'Position ' + f.pos + ', drift ' + f.d;
+      let body = f.via === 'cache'
+        ? 'The same edit shape has been seen before, so the drift was already known. No search was needed at all — this is how most resyncs are answered on real data.'
+        : 'Drift ' + f.d + ' goes into the cache: the next edit of the same shape will cost no search.';
+      if (f.back.steps > 0) body += ' Then walk back ' + f.back.steps
+        + ' bytes — the gap overshot the edit, and those bytes belong in the copy, not in the literal. What stays amber is the actual edit.';
+      return [head, t, body]; }
+    case 'emit-add': return ['EMIT', f.len === 0
+        ? 'Empty literal — just move to ' + f.aligned
+        : 'Add(' + f.len + ' bytes)',
+      (f.len === 0 ? 'Nothing to insert: the whole overshoot went back into the copy. ' : 'Write “insert these ' + f.len + ' bytes”. ')
+      + 'The cursor in the old document moves to ' + f.aligned + '.'];
+    case 'resync-fail': return ['NO LUCK','Every probe failed',
+      'Neither the remembered drifts nor the window turned anything up.'];
+    case 'ladder': return f.budget
+      ? ['LADDER','Time to build the index',
+         'Local searching has already read ' + f.scanned + ' bytes — past the ' + f.at + '-byte threshold. From here the index is the cheaper answer.']
+      : ['LADDER','The index does not pay for itself yet',
+         'Read ' + f.scanned + ' of ' + f.at + '. So these are simply new bytes that are not in the old document.'];
+    case 'skip': return ['SKIP AHEAD','Carry ' + f.len + ' bytes and probe further along',
+      'SKIP equals the widest gap (' + K.SKIP + '), so this stretch provably contains no resync point — we just looked for one. Consecutive skips merge into a single literal.'];
+    case 'index-build': return ['GLOBAL INDEX','Building it: ' + f.size + ' entries',
+      'One entry per ' + K.INDEXW + ' bytes of the old document. Built once per call — everything after this reuses it.'];
+    case 'index-try': return [(f.ok ? 'FOUND' : 'MISS'),
+      q(f.gram) + ' → position ' + f.pos + ', extends ' + f.ext,
+      f.ok ? 'Extends ' + f.ext + ' ≥ MIN_MATCH (' + K.MIN_MATCH + '). Move there — no window would ever have reached that far.'
+           : 'It extends less than MIN_MATCH (' + K.MIN_MATCH + '). Keep walking forward through the new document.'];
+    case 'index-none': return ['SEARCH EXHAUSTED','The index swept the whole remainder — nothing',
+      'There are no more matches, and there will not be any. Carry the rest verbatim.'];
+    case 'finish': return ['FINAL','Carry the remainder verbatim',
+      f.reason === 'short-tail' ? 'Less than SKIP is left — there is nothing left to search in.' : 'The index found nothing.'];
+    case 'done': return ['DONE','Patch complete',
+      'The full opcode list is on the left. Applying it is just replaying those opcodes in order.'];
+  }
+  return ['','',''];
+}
+
+function render() {
+  const f = FR[at];
+  paint(f);
+  const [chip, title, body] = narrate(f);
+  const good = /HIT|VERIFIED|FOUND|DONE|EMIT|ALIGNMENT/.test(chip);
+  const bad = /MISS|FALSE|NO LUCK|EXHAUSTED/.test(chip);
+  $('narr').innerHTML =
+    '<span class="chip ' + (good ? 'ok' : bad ? 'no' : '') + '">' + chip + '</span>' +
+    '<h3>' + title + '</h3><p>' + body + '</p>';
+
+  $('ops').innerHTML = f.chunks.map(c =>
+    c.k === 'copy'
+      ? '<span class="cp">Copy(' + c.offset + ',' + c.len + ')</span>'
+      : '<span class="ad">Add "' + NEW.substr(c.start, c.len).replace(/ /g,'␣') + '"</span>'
+  ).join('') || '<span class="note">nothing yet</span>';
+
+  const hot = f.t === 'tier1-try' ? f.d : (f.t === 'accept' && f.via === 'cache' ? f.d : null);
+  $('slots').innerHTML = '<i class="zero' + (hot === 0 ? ' hot' : '') + '">0</i>' +
+    f.shifts.map(d => '<i' + (d === hot ? ' class="hot"' : '') + '>' + (d > 0 ? '+' : '') + d + '</i>').join('');
+
+  const s = f.stats;
+  $('stats').innerHTML =
+    '<div><span>copies</span><b>' + s.copies + '</b></div>' +
+    '<div><span>literals</span><b>' + s.literals + '</b></div>' +
+    '<div><span>resyncs</span><b>' + s.resyncs + '</b></div>' +
+    '<div><span>answered by cache</span><b>' + s.hits + '</b></div>' +
+    '<div><span>window searches</span><b>' + s.searches + '</b></div>' +
+    '<div><span>base bytes read</span><b>' + f.scanned + '</b></div>' +
+    '<div><span>escalations</span><b>' + s.escalations + '</b></div>';
+
+  $('pos').textContent = (at + 1) + ' / ' + FR.length;
+  $('scrub').value = at;
+  $('prev').disabled = at === 0;
+  $('first').disabled = at === 0;
+  $('next').disabled = at === FR.length - 1;
+}
+
+const MILESTONE = new Set(['emit-copy','emit-add','accept','skip','index-build','finish','done','tier2-try','ladder']);
+function go(n) { at = Math.max(0, Math.min(FR.length - 1, n)); render(); }
+function jump() { let n = at + 1;
+  while (n < FR.length - 1 && !MILESTONE.has(FR[n].t)) n++; go(n); }
+function toggle() {
+  if (timer) { clearInterval(timer); timer = null; $('play').className = ''; return; }
+  $('play').className = 'on';
+  timer = setInterval(() => { if (at >= FR.length - 1) { toggle(); return; } go(at + 1); }, 550);
+}
+
+$('prev').onclick = () => go(at - 1);
+$('next').onclick = () => go(at + 1);
+$('first').onclick = () => go(0);
+$('jump').onclick = jump;
+$('play').onclick = toggle;
+$('scrub').oninput = (e) => go(+e.target.value);
+$('ex0').onclick = () => { if (timer) toggle(); load(0); };
+$('ex1').onclick = () => { if (timer) toggle(); load(1); };
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowRight') { e.preventDefault(); go(at + 1); }
+  if (e.key === 'ArrowLeft')  { e.preventDefault(); go(at - 1); }
+  if (e.key === ' ')          { e.preventDefault(); jump(); }
+});
+
+load(0);
+</script>
+</body>
+</html>
