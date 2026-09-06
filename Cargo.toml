@@ -8,7 +8,7 @@ repository = "https://github.com/tochka-public/bitcut"
 readme = "README.md"
 categories = ["command-line-utilities", "compression"]
 keywords = ["binary", "bin", "diff", "patch"]
-exclude = ["/.github", "/target", "/fuzz", "/docs"]
+exclude = ["/.github", "/target", "/fuzz", "/docs", "/demo-wasm"]
 
 [workspace]
 members = []
