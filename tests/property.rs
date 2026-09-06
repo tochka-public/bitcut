@@ -16,7 +16,7 @@
     dead_code
 )]
 
-use bitcut::{apply_patch, make_patch, Op};
+use bitcut::{apply_patch, base_fingerprint, inspect, make_patch, Op, PatchError};
 use proptest::collection::vec;
 use proptest::prelude::*;
 
@@ -217,4 +217,76 @@ fn simd_memcmp_exhaustive_small() {
             assert_eq!(restored, a, "reverse mismatch at pos={pos}, n={n}");
         }
     }
+}
+
+// =============================================================================
+// Base identity
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+
+    /// A patch must refuse any base other than the one it was built from.
+    #[test]
+    fn wrong_base_is_always_rejected(
+        old in vec(any::<u8>(), 1..512),
+        new in vec(any::<u8>(), 0..512),
+        flip in 0usize..512,
+    ) {
+        let patch = make_patch(&old, &new).expect("make_patch must succeed");
+        let mut other = old.clone();
+        let at = flip % other.len();
+        other[at] ^= 0xFF;
+
+        let rejected = matches!(
+            apply_patch(&other, &patch),
+            Err(PatchError::WrongBase { .. })
+        );
+        prop_assert!(rejected);
+        prop_assert_eq!(apply_patch(&old, &patch).expect("valid base"), new);
+    }
+
+    /// The header must describe the base the patch was actually built from.
+    #[test]
+    fn header_matches_the_base(
+        old in vec(any::<u8>(), 0..512),
+        new in vec(any::<u8>(), 0..512),
+    ) {
+        let patch = make_patch(&old, &new).expect("make_patch must succeed");
+        let header = inspect(&patch).expect("readable header").expect("v2 patch");
+        prop_assert_eq!((header.base_len, header.base_hash), base_fingerprint(&old));
+    }
+}
+
+// =============================================================================
+// Format limits
+// =============================================================================
+
+/// Inputs at the 4 GiB boundary must be refused, not truncated into a patch
+/// that reconstructs the wrong document.
+///
+/// Allocates over 4 GiB, so it is opt-in:
+/// `cargo test --test property -- --ignored four_gib`.
+#[test]
+#[ignore = "allocates more than 4 GiB"]
+fn four_gib_boundary_is_refused() {
+    let over = vec![0_u8; usize::try_from(u32::MAX).unwrap() + 1];
+    let small = b"small".to_vec();
+
+    assert_eq!(
+        make_patch(&over, &small),
+        Err(PatchError::InputTooLarge { len: over.len() })
+    );
+    assert_eq!(
+        make_patch(&small, &over),
+        Err(PatchError::InputTooLarge { len: over.len() })
+    );
+
+    // One byte below the boundary must still work.
+    let at_limit = vec![0_u8; usize::try_from(u32::MAX).unwrap()];
+    let patch = make_patch(&at_limit, &at_limit).expect("u32::MAX bytes must be accepted");
+    assert_eq!(
+        apply_patch(&at_limit, &patch).expect("valid patch"),
+        at_limit
+    );
 }

@@ -1,6 +1,6 @@
 [package]
 name = "bitcut"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 description = "Create and apply binary patches"
 license = "MIT"
@@ -8,11 +8,11 @@ repository = "https://github.com/tochka-public/bitcut"
 readme = "README.md"
 categories = ["command-line-utilities", "compression"]
 keywords = ["binary", "bin", "diff", "patch"]
-exclude = ["/.github", "/target", "/fuzz"]
+exclude = ["/.github", "/target", "/fuzz", "/docs"]
 
 [workspace]
 members = []
-exclude = ["fuzz"]
+exclude = ["fuzz", "demo-wasm"]
 
 [lib]
 path = "src/lib.rs"
@@ -23,7 +23,9 @@ required-features = ["cli"]
 path = "src/main.rs"
 
 [dependencies]
+memchr = "2.7"
 rustc-hash = "2.1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dependencies.clap]
 version = "4.5"
@@ -37,16 +39,22 @@ optional = true
 [features]
 default = ["cli"]
 cli = ["clap", "anyhow"]
+# Matcher instrumentation for the algorithm walkthrough. Off by default: it
+# adds a parameter checker and, later, the trace recorder, none of which the
+# library itself uses.
+demo = []
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 rstest = "0"
 proptest = "1"
 insta = "1.47.2"
+zstd = "0.13"
 
 [[bench]]
 name = "my_benchmark"
 harness = false
+test = false
 
 [lints.rust]
 warnings = "deny"

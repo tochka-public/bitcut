@@ -13,7 +13,16 @@ fuzz_target!(|data: &[u8]| {
     }
     let split = (data[0] as usize) % data.len();
     let (old, new) = data.split_at(split);
-    let patch = bitcut::make_diff(old, new);
+    let patch = bitcut::make_patch(old, new).expect("make_patch must succeed");
     let restored = bitcut::apply_patch(old, &patch).expect("valid patch must apply");
     assert_eq!(restored.as_slice(), new);
+
+    // The patch must name the base it was built from, and refuse any other.
+    let header = bitcut::inspect(&patch)
+        .expect("own patch must parse")
+        .expect("own patch is v2");
+    assert_eq!(
+        (header.base_len, header.base_hash),
+        bitcut::base_fingerprint(old)
+    );
 });

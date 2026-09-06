@@ -4,235 +4,108 @@
 //!
 //! * [`make_patch`] / [`make_patch_into`] — produce a patch describing how to
 //!   reconstruct `new` from `old`.
+//! * [`make_patch_stats`] / [`make_patch_into_stats`] — the same, also
+//!   returning [`PatchStats`] describing how the patch was found.
 //! * [`apply_patch`] / [`apply_patch_into`] — apply a patch to `old` and
 //!   recover `new`.
 //! * [`Op`] / [`OpIter`] — low-level access to the patch opcode stream.
+//! * [`inspect`] — read a patch's header without applying it.
+//!
+//! Both `old` and `new` are limited to `u32::MAX` (≈ 4 GiB) bytes.
 //!
 //! ## Patch format
 //!
-//! A patch is a sequence of opcodes:
+//! Patches are written in the sectioned v2 layout, which names the base it
+//! was built from; patches in the older opcode-stream layout are still read.
+//! Both are described in the `wire` module.
 //!
-//! ```text
-//! Copy: 0x00 offset:u32_le len:u32_le
-//! Add : 0x01 len:u32_le bytes...
-//! ```
+//! A patch built from one base **cannot** be applied to another: `old` is
+//! fingerprinted at build time and re-checked at apply time, and a mismatch
+//! is [`PatchError::WrongBase`] rather than a plausible-looking wrong
+//! document. The fingerprint is xxh3 — it detects a wrong or stale base, not
+//! a forged patch. If patches arrive from somewhere untrusted, authenticate
+//! them at the transport or storage layer.
 //!
-//! All integers are little-endian. The format limits both `old` and `new` to
-//! `u32::MAX` (≈ 4 GiB) bytes.
+//! ## Matching
+//!
+//! Matching is described in the `differ` module: the base is walked in
+//! lockstep with the new document rather than indexed up front, so the search
+//! cost tracks the number of edits rather than the size of the base. See
+//! [`PatchStats`] for the counters that report when that assumption stops
+//! holding.
+//!
+//! ## Cost
+//!
+//! Hashing the base is one linear pass over `old` on both the build and the
+//! apply side, and on a base large enough for the differ to skip most of it
+//! that pass dominates. On the benchmark corpus (1.6 MiB base, local edits)
+//! it is roughly 40 µs of the ~120 µs build and of the ~70 µs apply. A caller
+//! that cannot afford it can compare [`PatchHeader::base_len`] and
+//! [`base_fingerprint`] itself, once, and cache the result alongside the
+//! base.
 
-use rustc_hash::{FxBuildHasher, FxHashMap};
-use std::fmt;
+mod apply;
+#[cfg(feature = "demo")]
+pub mod demo;
+mod differ;
+mod encode;
+mod error;
+mod index;
+mod memcmp;
+mod op;
+mod vbyte;
+mod wire;
 
-const WINDOW_SIZE: usize = 10;
-const HASH_BASE: u64 = 1_934_123_457;
+pub use apply::{apply_patch, apply_patch_into};
+pub use differ::PatchStats;
+pub use error::PatchError;
+pub use index::RollingHash;
+pub use op::{Op, OpIter};
 
-const TAG_COPY: u8 = 0x00;
-const TAG_ADD: u8 = 0x01;
-const ADD_HEADER_LEN: usize = 5;
+use op::ADD_HEADER_LEN;
 
-/// Errors produced by the patch deserializer / applier.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PatchError {
-    /// Patch ended in the middle of an opcode.
-    UnexpectedEof,
-    /// Opcode tag is neither `Copy` nor `Add`.
-    InvalidOpcode(u8),
-    /// `Copy` references a range outside `old`.
-    CopyOutOfBounds {
-        /// Requested offset.
-        offset: u32,
-        /// Requested length.
-        len: u32,
-        /// Actual length of `old`.
-        old_len: usize,
-    },
-    /// Arithmetic overflow while computing a copy/add range. Indicates a
-    /// crafted or corrupted patch.
-    Overflow,
-    /// `make_patch` was called with an input larger than `u32::MAX` bytes.
-    InputTooLarge {
-        /// The offending length.
-        len: usize,
-    },
-}
-
-impl fmt::Display for PatchError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            PatchError::UnexpectedEof => f.write_str("unexpected end of patch"),
-            PatchError::InvalidOpcode(tag) => write!(f, "invalid opcode tag: 0x{tag:02X}"),
-            PatchError::CopyOutOfBounds {
-                offset,
-                len,
-                old_len,
-            } => write!(
-                f,
-                "copy out of bounds: offset={offset} len={len} old_len={old_len}"
-            ),
-            PatchError::Overflow => f.write_str("arithmetic overflow in patch range"),
-            PatchError::InputTooLarge { len } => {
-                write!(f, "input too large for patch format: {len} bytes")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PatchError {}
-
-/// A single patch opcode.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Op<'a> {
-    /// Copy `len` bytes from `old` starting at `offset`.
-    Copy {
-        /// Offset within `old`.
-        offset: u32,
-        /// Number of bytes to copy.
-        len: u32,
-    },
-    /// Append a literal byte run.
-    Add(&'a [u8]),
-}
-
-impl fmt::Debug for Op<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        enum Content<'a> {
-            Text(&'a str),
-            Bytes(&'a [u8]),
-        }
-
-        impl<'a> From<&'a [u8]> for Content<'a> {
-            fn from(value: &'a [u8]) -> Self {
-                match std::str::from_utf8(value) {
-                    Ok(s) => Content::Text(s),
-                    Err(_) => Content::Bytes(value),
-                }
-            }
-        }
-
-        impl fmt::Debug for Content<'_> {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                match self {
-                    Content::Text(s) => write!(f, "Text({s:?})"),
-                    Content::Bytes(b) => {
-                        write!(f, "Bytes(")?;
-                        for (i, byte) in b.iter().enumerate() {
-                            if i > 0 {
-                                write!(f, " ")?;
-                            }
-                            write!(f, "{byte:02X}")?;
-                        }
-                        write!(f, ")")
-                    }
-                }
-            }
-        }
-
-        match *self {
-            Self::Copy { offset, len } => f.debug_tuple("Copy").field(&offset).field(&len).finish(),
-            Self::Add(content) => f.debug_tuple("Add").field(&Content::from(content)).finish(),
-        }
-    }
-}
-
-impl<'a> Op<'a> {
-    /// Serialize this op into `out`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PatchError::InputTooLarge`] if an `Add` payload exceeds
-    /// `u32::MAX` bytes.
-    pub fn serialize_to(&self, out: &mut Vec<u8>) -> Result<(), PatchError> {
-        match *self {
-            Op::Copy { offset, len } => {
-                out.push(TAG_COPY);
-                out.extend_from_slice(&offset.to_le_bytes());
-                out.extend_from_slice(&len.to_le_bytes());
-                Ok(())
-            }
-            Op::Add(bytes) => {
-                let len = u32::try_from(bytes.len())
-                    .map_err(|_| PatchError::InputTooLarge { len: bytes.len() })?;
-                out.push(TAG_ADD);
-                out.extend_from_slice(&len.to_le_bytes());
-                out.extend_from_slice(bytes);
-                Ok(())
-            }
-        }
-    }
-
-    /// Parse the next opcode from `input`, returning the op and the remaining
-    /// bytes.
-    ///
-    /// # Errors
-    ///
-    /// See [`PatchError`] variants.
-    pub fn deserialize(input: &'a [u8]) -> Result<(Self, &'a [u8]), PatchError> {
-        let (&tag, rest) = input.split_first().ok_or(PatchError::UnexpectedEof)?;
-        match tag {
-            TAG_COPY => {
-                let (offset_bytes, rest) = rest
-                    .split_first_chunk::<4>()
-                    .ok_or(PatchError::UnexpectedEof)?;
-                let (len_bytes, rest) = rest
-                    .split_first_chunk::<4>()
-                    .ok_or(PatchError::UnexpectedEof)?;
-                Ok((
-                    Op::Copy {
-                        offset: u32::from_le_bytes(*offset_bytes),
-                        len: u32::from_le_bytes(*len_bytes),
-                    },
-                    rest,
-                ))
-            }
-            TAG_ADD => {
-                let (len_bytes, rest) = rest
-                    .split_first_chunk::<4>()
-                    .ok_or(PatchError::UnexpectedEof)?;
-                let declared = u32::from_le_bytes(*len_bytes);
-                let len = usize::try_from(declared).map_err(|_| PatchError::Overflow)?;
-                let (payload, rest) = rest
-                    .split_at_checked(len)
-                    .ok_or(PatchError::UnexpectedEof)?;
-                Ok((Op::Add(payload), rest))
-            }
-            other => Err(PatchError::InvalidOpcode(other)),
-        }
-    }
-
-    /// Iterate the opcodes in `patch` lazily, without allocating a `Vec`.
-    #[must_use]
-    pub fn iter(patch: &'a [u8]) -> OpIter<'a> {
-        OpIter { input: patch }
-    }
-}
-
-/// Iterator over the opcodes of a patch.
+/// What a patch states about itself, readable without applying it.
 ///
-/// Yields `Err` once and then stops on the first malformed opcode.
-#[derive(Debug, Clone)]
-pub struct OpIter<'a> {
-    input: &'a [u8],
+/// Only the v2 layout carries this; [`inspect`] returns `None` for a legacy
+/// patch, which identifies neither its base nor its opcode count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PatchHeader {
+    /// Length of the base the patch was built from.
+    pub base_len: u64,
+    /// xxh3 fingerprint of that base.
+    pub base_hash: u64,
+    /// Number of opcodes in the patch.
+    pub ops: u32,
+    /// Every copy reads forward of the previous one, so the patch can be
+    /// applied while streaming the base rather than seeking within it.
+    pub monotone_copies: bool,
 }
 
-impl<'a> Iterator for OpIter<'a> {
-    type Item = Result<Op<'a>, PatchError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.input.is_empty() {
-            return None;
-        }
-        match Op::deserialize(self.input) {
-            Ok((op, rest)) => {
-                self.input = rest;
-                Some(Ok(op))
-            }
-            Err(e) => {
-                // Stop iteration after the first error.
-                self.input = &[];
-                Some(Err(e))
-            }
-        }
+/// Read a patch's header without applying it.
+///
+/// Useful for checking a stored patch against a base before paying to load
+/// either, and for telemetry over a patch store.
+///
+/// # Errors
+///
+/// See [`PatchError`] variants.
+pub fn inspect(patch: &[u8]) -> Result<Option<PatchHeader>, PatchError> {
+    match wire::parse(patch)? {
+        wire::Layout::V1(_) => Ok(None),
+        wire::Layout::V2(header) => Ok(Some(PatchHeader {
+            base_len: header.base_len,
+            base_hash: header.base_hash,
+            ops: u32::try_from(header.ops).map_err(|_| PatchError::Overflow)?,
+            monotone_copies: header.flags & wire::FLAG_MONOTONE != 0,
+        })),
     }
+}
+
+/// Fingerprint a base document the way a v2 patch header records it.
+#[must_use]
+pub fn base_fingerprint(base: &[u8]) -> (u64, u64) {
+    wire::fingerprint(base)
 }
 
 /// Build a patch describing how to reconstruct `new` from `old`.
@@ -242,9 +115,7 @@ impl<'a> Iterator for OpIter<'a> {
 /// Returns [`PatchError::InputTooLarge`] if either `old` or `new` exceeds
 /// `u32::MAX` bytes.
 pub fn make_patch(old: &[u8], new: &[u8]) -> Result<Vec<u8>, PatchError> {
-    let mut out = Vec::with_capacity(estimate_patch_capacity(new.len()));
-    make_patch_into(old, new, &mut out)?;
-    Ok(out)
+    make_patch_stats(old, new).map(|(patch, _stats)| patch)
 }
 
 /// Build a patch into a caller-supplied buffer. The buffer is **not**
@@ -255,6 +126,33 @@ pub fn make_patch(old: &[u8], new: &[u8]) -> Result<Vec<u8>, PatchError> {
 /// Returns [`PatchError::InputTooLarge`] if either input exceeds `u32::MAX`
 /// bytes.
 pub fn make_patch_into(old: &[u8], new: &[u8], out: &mut Vec<u8>) -> Result<(), PatchError> {
+    make_patch_into_stats(old, new, out).map(|_stats| ())
+}
+
+/// Build a patch and report how it was found.
+///
+/// # Errors
+///
+/// Returns [`PatchError::InputTooLarge`] if either input exceeds `u32::MAX`
+/// bytes.
+pub fn make_patch_stats(old: &[u8], new: &[u8]) -> Result<(Vec<u8>, PatchStats), PatchError> {
+    let mut out = Vec::with_capacity(estimate_patch_capacity(new.len()));
+    let stats = make_patch_into_stats(old, new, &mut out)?;
+    Ok((out, stats))
+}
+
+/// Build a patch into a caller-supplied buffer and report how it was found.
+/// The buffer is **not** cleared first; ops are appended.
+///
+/// # Errors
+///
+/// Returns [`PatchError::InputTooLarge`] if either input exceeds `u32::MAX`
+/// bytes.
+pub fn make_patch_into_stats(
+    old: &[u8],
+    new: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<PatchStats, PatchError> {
     if u32::try_from(old.len()).is_err() {
         return Err(PatchError::InputTooLarge { len: old.len() });
     }
@@ -262,315 +160,18 @@ pub fn make_patch_into(old: &[u8], new: &[u8], out: &mut Vec<u8>) -> Result<(), 
         return Err(PatchError::InputTooLarge { len: new.len() });
     }
 
-    // Inputs too small to roll a window: emit `new` verbatim.
-    if old.len() < WINDOW_SIZE || new.len() < WINDOW_SIZE {
-        return Op::Add(new).serialize_to(out);
-    }
-
-    let map = build_hash_map(old);
-
-    // SAFETY (length): pre-checked above.
-    let Some(mut rolling) = RollingHash::new(new, WINDOW_SIZE, HASH_BASE) else {
-        return Op::Add(new).serialize_to(out);
-    };
-
-    let mut last_emitted: usize = 0;
-    let mut idx: usize = 0;
-
-    while let Some(hash) = rolling.next() {
-        if let Some(&match_pos) = map.get(&hash) {
-            let new_tail = new.get(idx..).unwrap_or(&[]);
-            let old_tail = old.get(match_pos..).unwrap_or(&[]);
-            let match_len = simd_memcmp(new_tail, old_tail);
-            if match_len >= WINDOW_SIZE {
-                if let Some(skipped) = new.get(last_emitted..idx) {
-                    if !skipped.is_empty() {
-                        Op::Add(skipped).serialize_to(out)?;
-                    }
-                }
-                let copy_offset = u32::try_from(match_pos).map_err(|_| PatchError::Overflow)?;
-                let copy_len = u32::try_from(match_len).map_err(|_| PatchError::Overflow)?;
-                Op::Copy {
-                    offset: copy_offset,
-                    len: copy_len,
-                }
-                .serialize_to(out)?;
-                idx = idx.checked_add(match_len).ok_or(PatchError::Overflow)?;
-                last_emitted = idx;
-
-                // Advance rolling hash past the match (we already consumed 1
-                // step via .next() above, so skip `match_len - 1` more).
-                // `nth(n)` consumes `n + 1` elements, hence `checked_sub(2)`.
-                if let Some(skip) = match_len.checked_sub(2) {
-                    let _ = rolling.nth(skip);
-                }
-                continue;
-            }
-        }
-        idx = idx.checked_add(1).ok_or(PatchError::Overflow)?;
-    }
-
-    if let Some(tail) = new.get(last_emitted..) {
-        if !tail.is_empty() {
-            Op::Add(tail).serialize_to(out)?;
-        }
-    }
-    Ok(())
+    let mut chunks = Vec::new();
+    let stats = differ::diff(old, new, &mut chunks);
+    encode::v2(&chunks, old, new, out)?;
+    Ok(stats)
 }
 
 #[inline]
 fn estimate_patch_capacity(new_len: usize) -> usize {
     // Heuristic: a perfectly-matching patch is ~9 bytes, a fully-literal one
-    // is `new_len + 5`. Pick a small floor.
-    new_len.saturating_add(ADD_HEADER_LEN).clamp(64, 4096)
-}
-
-/// Apply `patch` to `old` and return the reconstructed bytes.
-///
-/// # Errors
-///
-/// See [`PatchError`] variants. The applier rejects out-of-bounds copies
-/// and overflows; it never panics.
-pub fn apply_patch(old: &[u8], patch: &[u8]) -> Result<Vec<u8>, PatchError> {
-    let mut out = Vec::with_capacity(estimate_apply_capacity(patch.len()));
-    apply_patch_into(old, patch, &mut out)?;
-    Ok(out)
-}
-
-/// Apply `patch` into a caller-supplied buffer. The buffer is **not**
-/// cleared first; reconstructed bytes are appended.
-///
-/// # Errors
-///
-/// See [`PatchError`] variants.
-pub fn apply_patch_into(old: &[u8], patch: &[u8], out: &mut Vec<u8>) -> Result<(), PatchError> {
-    for op in Op::iter(patch) {
-        match op? {
-            Op::Copy { offset, len } => {
-                let start = usize::try_from(offset).map_err(|_| PatchError::Overflow)?;
-                let len_usize = usize::try_from(len).map_err(|_| PatchError::Overflow)?;
-                let end = start.checked_add(len_usize).ok_or(PatchError::Overflow)?;
-                let slice = old.get(start..end).ok_or(PatchError::CopyOutOfBounds {
-                    offset,
-                    len,
-                    old_len: old.len(),
-                })?;
-                out.extend_from_slice(slice);
-            }
-            Op::Add(bytes) => out.extend_from_slice(bytes),
-        }
-    }
-    Ok(())
-}
-
-#[inline]
-fn estimate_apply_capacity(patch_len: usize) -> usize {
-    patch_len.saturating_mul(2).clamp(64, 1 << 20)
-}
-
-#[inline]
-fn simd_memcmp(a: &[u8], b: &[u8]) -> usize {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: AVX2 availability checked at runtime.
-            return unsafe { simd_memcmp_avx2(a, b) };
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            // SAFETY: NEON availability checked at runtime.
-            return unsafe { simd_memcmp_neon(a, b) };
-        }
-    }
-
-    simd_memcmp_scalar(a, b)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[allow(clippy::cast_ptr_alignment)]
-unsafe fn simd_memcmp_avx2(a: &[u8], b: &[u8]) -> usize {
-    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
-
-    let len = a.len().min(b.len());
-    let mut i: usize = 0;
-    let pa = a.as_ptr();
-    let pb = b.as_ptr();
-
-    // SAFETY (all intrinsics below): AVX2 is enabled via `target_feature`.
-    // pa/pb come from slices of length ≥ len, and `i + 32 ≤ len` is checked
-    // by the `while let` guard, so all loads are in-bounds. The `*const u8`
-    // → `*const __m256i` cast is sound because `_mm256_loadu_si256` performs
-    // unaligned loads.
-    while let Some(next) = i.checked_add(32) {
-        if next > len {
-            break;
-        }
-        let chunk_a = _mm256_loadu_si256(pa.add(i).cast::<__m256i>());
-        let chunk_b = _mm256_loadu_si256(pb.add(i).cast::<__m256i>());
-        let cmp = _mm256_cmpeq_epi8(chunk_a, chunk_b);
-        let mask_signed = _mm256_movemask_epi8(cmp);
-        // i32 → u32 bit-cast (no `as`).
-        let mask = u32::from_ne_bytes(mask_signed.to_ne_bytes());
-
-        if mask != u32::MAX {
-            let inverted = !mask;
-            let diff_index = usize::try_from(inverted.trailing_zeros()).unwrap_or(usize::MAX);
-            return i.checked_add(diff_index).unwrap_or(len);
-        }
-        i = next;
-    }
-
-    simd_memcmp_tail(a, b, i, len)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn simd_memcmp_neon(a: &[u8], b: &[u8]) -> usize {
-    use std::arch::aarch64::{vceqq_u8, vld1q_u8, vminvq_u8};
-
-    let len = a.len().min(b.len());
-    let mut i: usize = 0;
-    let pa = a.as_ptr();
-    let pb = b.as_ptr();
-
-    // SAFETY (all intrinsics below): NEON is enabled via `target_feature`.
-    // pa/pb come from slices of length ≥ len, and `i + 16 ≤ len` is checked
-    // by the `while let` guard, so all loads are in-bounds.
-    while let Some(next) = i.checked_add(16) {
-        if next > len {
-            break;
-        }
-        let chunk_a = vld1q_u8(pa.add(i));
-        let chunk_b = vld1q_u8(pb.add(i));
-        let cmp = vceqq_u8(chunk_a, chunk_b);
-        let min = vminvq_u8(cmp);
-
-        if min != 0xFF_u8 {
-            // Find the exact mismatch position via bounded scalar walk.
-            let mut j: usize = 0;
-            while j < 16 {
-                let pos = i.checked_add(j).unwrap_or(len);
-                let av = a.get(pos).copied().unwrap_or(0);
-                let bv = b.get(pos).copied().unwrap_or(0);
-                if av != bv || pos >= len {
-                    return pos;
-                }
-                j = j.checked_add(1).unwrap_or(16);
-            }
-        }
-        i = next;
-    }
-
-    simd_memcmp_tail(a, b, i, len)
-}
-
-#[inline]
-fn simd_memcmp_tail(a: &[u8], b: &[u8], start: usize, len: usize) -> usize {
-    let mut i = start;
-    while i < len {
-        let av = a.get(i).copied().unwrap_or(0);
-        let bv = b.get(i).copied().unwrap_or(0);
-        if av != bv {
-            return i;
-        }
-        i = i.checked_add(1).unwrap_or(len);
-    }
-    i
-}
-
-#[inline]
-fn simd_memcmp_scalar(a: &[u8], b: &[u8]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
-}
-
-#[inline]
-fn window_hash(data: &[u8], base: u64) -> (u64, u64) {
-    let mut hash: u64 = 0;
-    let mut base_pow: u64 = 1;
-    let last = data.len().saturating_sub(1);
-    for (i, &byte) in data.iter().enumerate() {
-        hash = hash.wrapping_mul(base).wrapping_add(u64::from(byte));
-        if i < last {
-            base_pow = base_pow.wrapping_mul(base);
-        }
-    }
-    (hash, base_pow)
-}
-
-fn build_hash_map(data: &[u8]) -> FxHashMap<u64, usize> {
-    let Some(rh) = RollingHash::new(data, WINDOW_SIZE, HASH_BASE) else {
-        return FxHashMap::default();
-    };
-    let cap = data
-        .len()
-        .saturating_sub(WINDOW_SIZE)
-        .saturating_add(1_usize);
-    let mut map: FxHashMap<u64, usize> = FxHashMap::with_capacity_and_hasher(cap, FxBuildHasher);
-    for (i, h) in rh.enumerate() {
-        // Keep the *first* occurrence — earlier positions tend to yield
-        // longer matches and more compact patches.
-        map.entry(h).or_insert(i);
-    }
-    map
-}
-
-/// Iterator over rolling hashes of fixed-size windows.
-pub struct RollingHash<'a> {
-    data: &'a [u8],
-    pos: usize,
-    window_size: usize,
-    base_pow: u64,
-    hash: u64,
-    base: u64,
-}
-
-impl<'a> RollingHash<'a> {
-    /// Create a rolling hash iterator over `data`.
-    ///
-    /// Returns `None` if `data` is shorter than `window_size`.
-    #[must_use]
-    pub fn new(data: &'a [u8], window_size: usize, base: u64) -> Option<Self> {
-        let initial = data.get(..window_size)?;
-        let (hash, base_pow) = window_hash(initial, base);
-        Some(Self {
-            data,
-            pos: 0,
-            window_size,
-            base_pow,
-            hash,
-            base,
-        })
-    }
-}
-
-impl Iterator for RollingHash<'_> {
-    type Item = u64;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let end = self.pos.checked_add(self.window_size)?;
-        if end > self.data.len() {
-            return None;
-        }
-
-        let result = self.hash;
-
-        // Roll the hash forward to the next window, if any.
-        if let (Some(&out_byte), Some(&in_byte)) = (self.data.get(self.pos), self.data.get(end)) {
-            self.hash = self
-                .hash
-                .wrapping_sub(u64::from(out_byte).wrapping_mul(self.base_pow))
-                .wrapping_mul(self.base)
-                .wrapping_add(u64::from(in_byte));
-        }
-
-        self.pos = self.pos.checked_add(1)?;
-        Some(result)
-    }
+    // is `new_len + 5`. Pick a small floor and a ceiling that covers the
+    // patch sizes this crate is tuned for without over-reserving.
+    new_len.saturating_add(ADD_HEADER_LEN).clamp(64, 1 << 16)
 }
 
 #[cfg(test)]
@@ -589,6 +190,9 @@ impl Iterator for RollingHash<'_> {
 )]
 mod tests {
     use super::*;
+    use crate::index::WINDOW_SIZE;
+    use crate::memcmp::simd_memcmp;
+    use crate::wire::TAG_COPY;
     use rstest::rstest;
     use std::collections::HashSet;
 
@@ -773,5 +377,442 @@ mod tests {
         patch.push(0xEE);
         let collected: Vec<_> = Op::iter(&patch).collect();
         insta::assert_debug_snapshot!(collected);
+    }
+
+    /// `memchr::memmem` takes the haystack first. Swapping the arguments still
+    /// type-checks and silently finds nothing, so pin the order down.
+    #[test]
+    fn memmem_argument_order() {
+        assert_eq!(memchr::memmem::find(b"xxhello", b"hello"), Some(2));
+    }
+
+    /// A local edit must not touch the global index, and the drift cache must
+    /// absorb repeated edits of the same shape.
+    #[test]
+    fn local_edits_do_not_escalate() {
+        let old: Vec<u8> = (0..200_000_u32).flat_map(u32::to_le_bytes).collect();
+        let mut new = old.clone();
+        // Three length-changing edits at unrelated positions.
+        for at in [10_000_usize, 300_000, 600_000] {
+            new.splice(at..at, b"INSERTED-PAYLOAD".iter().copied());
+        }
+
+        let (patch, stats) = make_patch_stats(&old, &new).unwrap();
+        assert_eq!(apply_patch(&old, &patch).unwrap(), new);
+        assert_eq!(stats.escalations, 0, "a local edit must not need the index");
+        assert!(
+            stats.old_bytes_scanned < u64::try_from(old.len()).unwrap(),
+            "window search scanned {} of {} base bytes",
+            stats.old_bytes_scanned,
+            old.len()
+        );
+    }
+
+    /// Repeating the *same* length delta must be answered from the drift
+    /// cache rather than by searching again.
+    #[test]
+    fn repeated_edit_shape_hits_the_shift_cache() {
+        let unit: Vec<u8> = (0..2_000_u32).flat_map(u32::to_le_bytes).collect();
+        let old = unit.repeat(4);
+        let mut new = old.clone();
+        for at in (5_000_usize..30_000).step_by(4_000) {
+            new.splice(at..at, b"DELTA".iter().copied());
+        }
+
+        let (patch, stats) = make_patch_stats(&old, &new).unwrap();
+        assert_eq!(apply_patch(&old, &patch).unwrap(), new);
+        assert!(
+            stats.shift_cache_hits > 0,
+            "expected drift-cache hits, got {stats:?}"
+        );
+    }
+
+    /// A wholesale reorder is exactly what local resync cannot see; the
+    /// global index must catch it instead of producing one huge literal.
+    #[test]
+    fn reorder_escalates_and_still_copies() {
+        let head: Vec<u8> = (0..30_000_u32).flat_map(u32::to_le_bytes).collect();
+        let tail: Vec<u8> = (500_000..530_000_u32).flat_map(u32::to_le_bytes).collect();
+        let old: Vec<u8> = head.iter().chain(tail.iter()).copied().collect();
+        let new: Vec<u8> = tail.iter().chain(head.iter()).copied().collect();
+
+        let (patch, stats) = make_patch_stats(&old, &new).unwrap();
+        assert_eq!(apply_patch(&old, &patch).unwrap(), new);
+        assert!(stats.escalations > 0, "expected escalation, got {stats:?}");
+        assert!(
+            patch.len() < new.len() / 2,
+            "reorder degenerated into literals: patch {} for new {}",
+            patch.len(),
+            new.len()
+        );
+    }
+
+    /// A 32-byte anchor that occurs many times must not align the differ to
+    /// the wrong occurrence.
+    #[test]
+    fn repeated_anchor_does_not_misalign() {
+        let filler = b"REPEATED-32-BYTE-ANCHOR-XXXXXXXX";
+        assert_eq!(filler.len(), 32);
+        let mut old = Vec::new();
+        for i in 0..500_u32 {
+            old.extend_from_slice(filler);
+            old.extend_from_slice(&i.to_le_bytes());
+        }
+        let mut new = old.clone();
+        new.splice(9_000..9_000, b"WEDGE".iter().copied());
+
+        let patch = make_patch(&old, &new).unwrap();
+        assert_eq!(apply_patch(&old, &patch).unwrap(), new);
+    }
+
+    /// Patches written before the v2 header existed must keep applying.
+    #[test]
+    fn v1_patches_still_apply() {
+        let old: Vec<u8> = (0..20_000_u32).flat_map(u32::to_le_bytes).collect();
+        let mut new = old.clone();
+        new.splice(30_000..30_000, b"LEGACY".iter().copied());
+
+        let mut chunks = Vec::new();
+        differ::diff(&old, &new, &mut chunks);
+        let mut legacy = Vec::new();
+        encode::v1(&chunks, &new, &mut legacy).unwrap();
+
+        assert!(
+            !legacy.starts_with(&wire::MAGIC),
+            "a v1 patch must not be mistaken for a v2 one"
+        );
+        assert_eq!(apply_patch(&old, &legacy).unwrap(), new);
+        assert_eq!(inspect(&legacy).unwrap(), None);
+
+        // Both layouts must decode to the same opcode sequence.
+        let modern = make_patch(&old, &new).unwrap();
+        let from_v1 = Op::iter(&legacy).collect::<Result<Vec<_>, _>>().unwrap();
+        let from_v2 = Op::iter(&modern).collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(from_v1, from_v2);
+    }
+
+    /// The failure this format exists to prevent: a patch applied to a
+    /// different version of the base must error, not silently produce a
+    /// plausible document.
+    #[test]
+    fn wrong_base_is_rejected() {
+        let old: Vec<u8> = (0..5_000_u32).flat_map(u32::to_le_bytes).collect();
+        let mut new = old.clone();
+        new.splice(1_000..1_000, b"CHANGE".iter().copied());
+        let patch = make_patch(&old, &new).unwrap();
+
+        // Same length, one byte different — the length check alone would miss it.
+        let mut impostor = old.clone();
+        impostor[4_096] ^= 0xFF;
+        assert_eq!(impostor.len(), old.len());
+
+        let err = apply_patch(&impostor, &patch).unwrap_err();
+        assert!(
+            matches!(err, PatchError::WrongBase { .. }),
+            "expected WrongBase, got {err:?}"
+        );
+
+        // And a base of a different length.
+        let err = apply_patch(&old[..old.len() - 1], &patch).unwrap_err();
+        assert!(matches!(err, PatchError::WrongBase { .. }), "{err:?}");
+
+        // The genuine base still applies.
+        assert_eq!(apply_patch(&old, &patch).unwrap(), new);
+    }
+
+    #[test]
+    fn inspect_reports_the_header() {
+        let old: Vec<u8> = (0..5_000_u32).flat_map(u32::to_le_bytes).collect();
+        let mut new = old.clone();
+        new.extend_from_slice(b"TAIL");
+        let patch = make_patch(&old, &new).unwrap();
+
+        let header = inspect(&patch).unwrap().unwrap();
+        let (len, hash) = base_fingerprint(&old);
+        assert_eq!(header.base_len, len);
+        assert_eq!(header.base_hash, hash);
+        assert!(header.monotone_copies, "an append only copies forward");
+        assert_eq!(
+            usize::try_from(header.ops).unwrap(),
+            Op::iter(&patch).count()
+        );
+    }
+
+    #[test]
+    fn future_versions_are_refused() {
+        let old = b"the base document, long enough to matter";
+        let mut patch = make_patch(old, b"the base document, long enough to matter!").unwrap();
+        patch[4] = 99;
+        assert_eq!(
+            apply_patch(old, &patch),
+            Err(PatchError::UnsupportedVersion(99))
+        );
+    }
+
+    #[test]
+    fn streamvbyte_roundtrips_every_width() {
+        let values: Vec<u32> = (0..40_u32)
+            .flat_map(|shift| {
+                let base = 1_u32.checked_shl(shift).unwrap_or(0);
+                [base.wrapping_sub(1), base, base.wrapping_add(1)]
+            })
+            .collect();
+        let mut buffer = Vec::new();
+        vbyte::encode(&values, &mut buffer);
+        assert_eq!(buffer.len(), vbyte::encoded_len(&values));
+        let decoded: Vec<u32> = vbyte::Reader::new(&buffer, values.len()).unwrap().collect();
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn zigzag_roundtrips_and_keeps_small_steps_small() {
+        for value in [0_i32, 1, -1, 2, -2, 127, -128, i32::MAX, i32::MIN] {
+            assert_eq!(
+                vbyte::unzigzag(vbyte::zigzag(value)),
+                value,
+                "value={value}"
+            );
+        }
+        // The whole point: a small step in either direction stays one byte.
+        for value in -63_i32..=63 {
+            assert!(vbyte::zigzag(value) <= 0xFF, "value={value}");
+        }
+    }
+
+    /// Two documents with nothing in common must still round-trip, and must
+    /// not cost more than carrying `new` verbatim plus a header.
+    #[test]
+    fn dissimilar_inputs_roundtrip() {
+        let old: Vec<u8> = (0..40_000_u32).flat_map(u32::to_le_bytes).collect();
+        let new: Vec<u8> = (0..40_000_u32)
+            .flat_map(|n| n.wrapping_mul(2_654_435_761).to_le_bytes())
+            .collect();
+        let patch = make_patch(&old, &new).unwrap();
+        assert_eq!(apply_patch(&old, &patch).unwrap(), new);
+        assert!(
+            patch.len() < new.len() + 1024,
+            "patch {} exceeds new {} by more than a header",
+            patch.len(),
+            new.len()
+        );
+    }
+
+    /// The defaults must satisfy the invariants the matcher is happiest with.
+    #[test]
+    fn default_params_are_sound() {
+        assert_eq!(differ::Params::for_input(1 << 20).check(), Ok(()));
+        assert_eq!(differ::Params::for_input(16).check(), Ok(()));
+        let p = differ::Params::for_input(1 << 20);
+        assert_eq!(p.skip_ahead(), *p.gaps().last().unwrap());
+    }
+
+    #[rstest]
+    #[case::ladder_must_start_at_zero(
+        |p: &mut differ::Params| p.gaps[0] = 4,
+        differ::ParamsError::GapLadder
+    )]
+    #[case::ladder_must_ascend(
+        |p: &mut differ::Params| p.gaps.swap(1, 2),
+        differ::ParamsError::GapOrder
+    )]
+    #[case::match_below_anchor(
+        |p: &mut differ::Params| p.min_match = p.anchor + 1,
+        differ::ParamsError::MinMatchAboveAnchor
+    )]
+    #[case::verify_above_anchor(
+        |p: &mut differ::Params| p.anchor_verify = p.anchor - 1,
+        differ::ParamsError::VerifyBelowAnchor
+    )]
+    #[case::window_holds_an_anchor(
+        |p: &mut differ::Params| p.window_half_width = 1,
+        differ::ParamsError::WindowBelowAnchor
+    )]
+    #[case::slots_are_bounded(
+        |p: &mut differ::Params| p.slots = 999,
+        differ::ParamsError::TooManySlots
+    )]
+    fn bad_params_are_named(
+        #[case] break_it: fn(&mut differ::Params),
+        #[case] expected: differ::ParamsError,
+    ) {
+        let mut params = differ::Params::for_input(1 << 20);
+        break_it(&mut params);
+        assert_eq!(params.check(), Err(expected));
+    }
+
+    /// Parameters the checker rejects must still produce a correct patch —
+    /// only a worse one. Nothing about correctness may depend on tuning.
+    #[test]
+    fn rejected_params_still_roundtrip() {
+        let old: Vec<u8> = (0..40_000_u32).flat_map(u32::to_le_bytes).collect();
+        let mut new = old.clone();
+        new.splice(60_000..60_000, b"WEDGE".iter().copied());
+        new.truncate(120_000);
+
+        // Every rule broken at once: a match threshold above the anchor, a
+        // verification bar below it, and a window too small to hold one.
+        let mut params = differ::Params::for_input(new.len());
+        params.min_match = 64;
+        params.anchor = 4;
+        params.anchor_verify = 2;
+        params.window_half_width = 1;
+        params.gaps = [0, 1, 0, 0, 0, 0, 0, 0];
+        params.gap_count = 2;
+        params.slots = 0;
+        assert_eq!(
+            params.check(),
+            Err(differ::ParamsError::MinMatchAboveAnchor)
+        );
+
+        let mut chunks = Vec::new();
+        differ::diff_with(&old, &new, params, &mut chunks);
+        let mut patch = Vec::new();
+        encode::v2(&chunks, &old, &new, &mut patch).unwrap();
+        assert_eq!(apply_patch(&old, &patch).unwrap(), new);
+    }
+
+    /// Recording must not change what the matcher decides. If it did, the
+    /// walkthrough would be describing a different algorithm from the one that
+    /// builds real patches.
+    #[test]
+    fn tracing_does_not_change_the_patch() {
+        let old: Vec<u8> = (0..30_000_u32).flat_map(u32::to_le_bytes).collect();
+        let mut new = old.clone();
+        new.splice(40_000..40_000, b"INSERTED-PAYLOAD".iter().copied());
+        new.splice(90_000..90_016, b"REPLACED".iter().copied());
+        new.extend_from_slice(b"APPENDED TAIL");
+
+        let params = differ::Params::for_input(new.len());
+        let mut plain = Vec::new();
+        let quiet = differ::diff_with(&old, &new, params, &mut plain);
+
+        let mut traced = Vec::new();
+        let (loud, recorder) =
+            differ::diff_traced(&old, &new, params, CountingTrace::default(), &mut traced);
+
+        assert_eq!(plain, traced, "tracing changed the opcodes");
+        assert_eq!(quiet, loud, "tracing changed the statistics");
+        assert!(recorder.events > 0, "nothing was recorded");
+    }
+
+    #[derive(Default)]
+    struct CountingTrace {
+        events: usize,
+    }
+
+    impl differ::Trace for CountingTrace {
+        const ENABLED: bool = true;
+        fn record(&mut self, _at: differ::At, _stats: &PatchStats, _event: differ::Event<'_>) {
+            self.events += 1;
+        }
+    }
+
+    /// The log must account for every byte of `new`. A recorder replaying only
+    /// the emitted opcodes has to rebuild the document exactly — if the
+    /// matcher writes an opcode without reporting it, this is what catches it.
+    #[rstest]
+    #[case::local_edits(
+        b"cp:Acme,Borg,Cyan|01.03 pay 10|01.03 fee 20|01.03 pay 30|01.03 fee 40".to_vec(),
+        b"cp:Acme,Beta,Borg,Cyan|01.03 payed 10|01.03 fee 20|01.03 payed 30|01.03 fee 40|01.03 fee 50".to_vec(),
+    )]
+    #[case::appended_tail(
+        b"cp:Acme,Borg,Cyan|01.03 pay 10|01.03 fee 20".to_vec(),
+        b"cp:Acme,Borg,Cyan|01.03 pay 10|01.03 fee 20|99.99 zzz 000111222333".to_vec(),
+    )]
+    #[case::swapped(
+        b"cp:Acme,Borg,Cyan|01.03 done|09.09 audit|10.09 audit".to_vec(),
+        b"|09.09 audit|10.09 auditcp:Acme,Borg,Cyan|01.03 done".to_vec(),
+    )]
+    #[case::unrelated(b"aaaaaaaaaaaaaaaaaaaaaaaa".to_vec(), b"zzzzzzzzzzzzzzzzzzzzzzzz".to_vec())]
+    #[case::empty_new(b"cp:Acme,Borg,Cyan|01.03 pay 10".to_vec(), vec![])]
+    fn the_log_accounts_for_every_byte(#[case] old: Vec<u8>, #[case] new: Vec<u8>) {
+        let mut params = differ::Params::for_input(new.len());
+        params.min_match = 6;
+        params.anchor = 6;
+        params.anchor_verify = 14;
+        params.gaps = [0, 2, 6, 8, 0, 0, 0, 0];
+        params.gap_count = 4;
+        params.window_half_width = 8;
+        params.slots = 4;
+
+        let mut chunks = Vec::new();
+        let replay = Replay {
+            old: old.clone(),
+            new: new.clone(),
+            out: Vec::new(),
+        };
+        let (_stats, replay) = differ::diff_traced(&old, &new, params, replay, &mut chunks);
+        assert_eq!(
+            replay.out, new,
+            "replaying only the recorded opcodes did not rebuild `new`"
+        );
+    }
+
+    /// Rebuilds `new` from nothing but the recorded opcodes.
+    struct Replay {
+        old: Vec<u8>,
+        new: Vec<u8>,
+        out: Vec<u8>,
+    }
+
+    impl differ::Trace for Replay {
+        const ENABLED: bool = true;
+        fn record(&mut self, _at: differ::At, _stats: &PatchStats, event: differ::Event<'_>) {
+            match event {
+                differ::Event::EmittedCopy { offset, len } => {
+                    self.out.extend_from_slice(&self.old[offset..offset + len]);
+                }
+                differ::Event::EmittedLiteral { start, len, .. } => {
+                    self.out.extend_from_slice(&self.new[start..start + len]);
+                }
+                differ::Event::Restarted { .. } => self.out.clear(),
+                _ => {}
+            }
+        }
+    }
+
+    /// The JSON log must be well formed and describe the same run.
+    #[cfg(feature = "demo")]
+    #[test]
+    fn trace_json_is_parseable_and_complete() {
+        let old = b"cp:Acme,Borg,Cyan|01.03 pay 10|01.03 fee 20|01.03 pay 30|01.03 fee 40";
+        let new = b"cp:Acme,Beta,Borg,Cyan|01.03 payed 10|01.03 fee 20|01.03 payed 30|01.03 fee 40";
+        let mut params = differ::Params::for_input(new.len());
+        params.min_match = 6;
+        params.anchor = 6;
+        params.anchor_verify = 14;
+        params.gaps = [0, 2, 6, 8, 0, 0, 0, 0];
+        params.gap_count = 4;
+        params.window_half_width = 16;
+        params.slots = 4;
+
+        let json = crate::demo::trace_json(old, new, params).unwrap();
+        assert!(json.starts_with('[') && json.ends_with(']'));
+        assert_eq!(
+            json.matches("\"t\":").count(),
+            json.matches("{\"t\":").count(),
+            "every frame must open with its tag"
+        );
+        assert!(json.contains("\"t\":\"compared\""));
+        assert!(json.contains("\"t\":\"aligned\""));
+        // Braces must balance, which is the cheapest structural check there is.
+        assert_eq!(json.matches('{').count(), json.matches('}').count());
+    }
+
+    #[test]
+    fn stats_count_emitted_opcodes() {
+        let old: Vec<u8> = (0..50_000_u32).flat_map(u32::to_le_bytes).collect();
+        let mut new = old.clone();
+        new.splice(50_000..50_000, b"XYZZY".iter().copied());
+
+        let (patch, stats) = make_patch_stats(&old, &new).unwrap();
+        let ops = Op::iter(&patch).collect::<Result<Vec<_>, _>>().unwrap();
+        let copies = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Copy { .. }))
+            .count();
+        let literals = ops.iter().filter(|op| matches!(op, Op::Add(_))).count();
+        assert_eq!(usize::try_from(stats.copies).unwrap(), copies);
+        assert_eq!(usize::try_from(stats.literals).unwrap(), literals);
     }
 }

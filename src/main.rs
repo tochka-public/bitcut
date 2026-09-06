@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
 };
 
-use bitcut::{apply_patch, make_patch, Op};
+use bitcut::{apply_patch, inspect, make_patch, Op};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -45,6 +45,10 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Debug { patch } => {
             let patch = fs::read(patch)?;
+            match inspect(&patch)? {
+                Some(header) => println!("{header:#?}"),
+                None => println!("legacy patch: no header, base cannot be identified"),
+            }
             let ops: Vec<_> = Op::iter(&patch).collect::<Result<_, _>>()?;
             println!("{ops:#?}");
         }

@@ -15,4 +15,10 @@ fuzz_target!(|data: &[u8]| {
     let split = (data[0] as usize) % data.len();
     let (old, patch) = data.split_at(split);
     let _ = bitcut::apply_patch(old, patch);
+    let _ = bitcut::inspect(patch);
+    for op in bitcut::Op::iter(patch) {
+        if op.is_err() {
+            break;
+        }
+    }
 });
