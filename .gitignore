@@ -1,3 +1,4 @@
 /target
 /benches/fixtures/*
 !/benches/fixtures/.gitkeep
+.DS_Store
