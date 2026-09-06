@@ -1,0 +1,48 @@
+[workspace]
+# Only `release-plz release-pr` is ever run, and it proposes the bump and
+# writes the changelog entry. These three say what should happen if somebody
+# runs `release-plz release` anyway: nothing that could reach crates.io or
+# stamp a tag behind the back of `.github/workflows/release.yml`, which
+# publishes only after the tests have run.
+publish = false
+git_tag_enable = false
+git_release_enable = false
+
+changelog_update = true
+
+# Refuse a bump that the API surface says is too small for what changed.
+semver_check = true
+
+[changelog]
+# Declared here rather than left in the file: release-plz rewrites the header
+# on every run, so a header it does not know about ends up duplicated below
+# the one it wrote.
+header = """
+# Changelog
+
+Written by release-plz from the commit messages, so a commit subject is what a
+reader of this file ends up with. A `feat!:` prefix or a `BREAKING CHANGE:`
+trailer is what makes a release major.
+
+Releases up to `v0.1.6` predate this file. They are on
+[crates.io](https://crates.io/crates/bitcut/versions) and in the git history.
+"""
+
+# A breaking change is never dropped by a parser below, whatever it looks like.
+protect_breaking_commits = true
+
+# Order matters: the first match wins. The catch-all at the end is what keeps
+# a version's section from ever coming out empty, which the release gate would
+# otherwise read as a missing entry.
+commit_parsers = [
+  { message = "^ci", skip = true },
+  { message = "^test", skip = true },
+  # release-plz's own bump commits, which say nothing a reader wants.
+  { message = "^chore: release", skip = true },
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^perf", group = "Performance" },
+  { message = "^refactor", group = "Changed" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^.*", group = "Other" },
+]

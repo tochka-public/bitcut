@@ -1,0 +1,43 @@
+name: Release PR
+
+# Keeps a pull request open that bumps the version and writes the changelog
+# entry for whatever has landed on master since the last release. Merging it
+# is what decides to release; pushing the tag afterwards is what does it.
+#
+# It stops there deliberately. Publishing runs from `release.yml`, behind the
+# tests, and a tag pushed by this workflow's token would not trigger it:
+# GitHub does not raise workflow events for pushes made with GITHUB_TOKEN.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-pr
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    name: propose the next version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Without it `semver_check` logs a warning and moves on, so a bump that
+      # is too small for what changed would be proposed anyway.
+      - uses: taiki-e/install-action@cargo-semver-checks
+
+      - uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
