@@ -1,47 +1,133 @@
 name: Release
 
+# Pushing a `v*` tag publishes it. `workflow_dispatch` republishes a tag that
+# already exists, for when a run failed somewhere after the gate and deleting
+# and re-pushing the tag would be the only other way back.
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish, e.g. v2.0.0'
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
-  publish:
-    name: publish to crates.io
+  # Everything that can say no, before anything reaches crates.io. A publish
+  # cannot be taken back: a yanked version still occupies its number forever.
+  verify:
+    name: verify
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
-      - name: verify tag matches Cargo.toml version
-        shell: bash
+      - uses: Swatinem/rust-cache@v2
+
+      - name: the tag names the version in the manifest
+        id: tag
+        env:
+          # Read through the environment rather than interpolated into the
+          # script: the dispatch input is caller-controlled text.
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${INPUT_TAG:-$REF_NAME}"
+          version="${tag#v}"
           manifest="$(grep -m1 '^version =' Cargo.toml | cut -d '"' -f2)"
-          if [ "$tag" != "$manifest" ]; then
-            echo "tag v$tag does not match Cargo.toml version $manifest" >&2
+          if [ "$version" != "$manifest" ]; then
+            echo "tag $tag does not match Cargo.toml version $manifest" >&2
             exit 1
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: verify tag is on master
-        shell: bash
+      - name: the tag is on master
         run: |
           set -euo pipefail
           git fetch origin master
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
-            echo "tag commit $GITHUB_SHA is not reachable from origin/master" >&2
+          if ! git merge-base --is-ancestor HEAD origin/master; then
+            echo "tag commit is not reachable from origin/master" >&2
             exit 1
           fi
 
+      - name: the changelog describes this version
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(./.github/changelog.sh "$VERSION")" ]; then
+            echo "CHANGELOG.md has no entry for $VERSION" >&2
+            exit 1
+          fi
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo clippy (no default features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      # `cargo publish` compiles the packaged crate but never runs its tests,
+      # so without this a tag on a red commit publishes.
+      - name: cargo test (all features)
+        run: cargo test --locked --all-features
+
+      - name: cargo test (no default features)
+        run: cargo test --locked --no-default-features
+
+      - name: cargo publish --dry-run
+        run: cargo publish --locked --dry-run
+
+  publish:
+    name: publish
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # --locked so the versions that ship are the versions `verify` tested.
       - name: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: cargo publish
+        run: cargo publish --locked
+
+      - name: collect the release notes
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: ./.github/changelog.sh "$VERSION" > notes.md
+
+      - name: github release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: v${{ needs.verify.outputs.version }}
+          body_path: notes.md
