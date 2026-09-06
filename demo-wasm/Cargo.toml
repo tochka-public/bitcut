@@ -1,0 +1,25 @@
+[package]
+name = "bitcut-demo-wasm"
+version = "0.0.0"
+publish = false
+edition = "2021"
+description = "WASM shim exposing the bitcut matcher's decision log to the walkthrough page"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies.bitcut]
+path = ".."
+default-features = false
+features = ["demo"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]
+members = ["."]

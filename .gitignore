@@ -1,2 +1,7 @@
 /target
+/demo-wasm/target
 .DS_Store
+
+# Built by .github/workflows/pages.yml from the commit being deployed, so that
+# the page and the crate cannot drift apart.
+/docs/bitcut.wasm

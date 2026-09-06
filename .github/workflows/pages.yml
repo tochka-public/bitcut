@@ -1,0 +1,63 @@
+name: Pages
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'demo-wasm/**'
+      - 'src/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+# The walkthrough runs the crate itself, compiled to wasm. Building it here
+# rather than committing the binary is what keeps the two from drifting: there
+# is one artifact and it comes from the commit being deployed.
+env:
+  CARGO_TERM_COLOR: always
+  WASM: demo-wasm/target/wasm32-unknown-unknown/release/bitcut_demo_wasm.wasm
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: demo-wasm
+      - name: build the walkthrough's wasm
+        run: |
+          cargo build \
+            --manifest-path demo-wasm/Cargo.toml \
+            --target-dir demo-wasm/target \
+            --target wasm32-unknown-unknown \
+            --release
+      - name: assemble the site
+        run: cp "$WASM" docs/bitcut.wasm
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  deploy:
+    name: deploy
+    needs: build
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

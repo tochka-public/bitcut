@@ -1,0 +1,718 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bitcut — the diff algorithm, step by step</title>
+<meta name="description" content="An interactive, step-by-step walkthrough of the tiered resync differ used by bitcut, driven by the crate itself compiled to WebAssembly.">
+<style>
+:root{
+  --ink:#16181d; --muted:#6b7280; --line:#dde1e8; --paper:#f7f8fa; --card:#fff;
+  --grey:#e6eaf0; --blue:#1d6feb; --green:#0f7b46; --red:#c2410c;
+  --cw:12px; --fs:11px;
+}
+*{box-sizing:border-box}
+html,body{overflow-x:hidden}
+body{margin:0;background:var(--paper);color:var(--ink);
+     font:400 17px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif;
+     -webkit-font-smoothing:antialiased}
+.wrap{max-width:1180px;margin:0 auto;padding:32px 20px 80px}
+h1{font-size:40px;line-height:1.05;letter-spacing:-.03em;margin:0 0 6px}
+.lede{font-size:19px;color:var(--muted);margin:0 0 22px}
+.lede a{color:var(--ink)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:22px;margin:0 0 18px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+button{font:inherit;border:1px solid var(--line);background:#fff;color:var(--ink);
+       border-radius:12px;padding:9px 16px;cursor:pointer}
+button:hover{background:#f0f3f8}
+button:disabled{opacity:.4;cursor:default}
+button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+button.big{font-size:19px;padding:12px 22px;font-weight:600;min-width:132px}
+
+textarea{width:100%;font:500 13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+         border:1px solid var(--line);border-radius:12px;padding:10px 12px;resize:vertical;
+         min-height:66px;background:#fbfcfe;color:var(--ink)}
+textarea:focus{outline:2px solid #b9d3fb;outline-offset:-1px}
+.knobs{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:14px}
+.knob{border:1px solid var(--line);border-radius:12px;padding:9px 11px}
+.knob label{display:block;font:700 11px ui-monospace,Menlo,monospace;letter-spacing:.05em;color:#41506b}
+.knob input{width:100%;border:0;border-bottom:1px solid var(--line);background:transparent;
+            font:600 15px ui-monospace,Menlo,monospace;color:var(--ink);padding:3px 0}
+.knob input:focus{outline:none;border-bottom-color:var(--blue)}
+.knob small{display:block;color:var(--muted);font-size:11px;margin-top:3px;line-height:1.35}
+.bad{color:var(--red);font-size:15px;margin-top:12px}
+
+.strip{margin:14px 0 0}
+.striplab{font-size:13px;letter-spacing:.08em;color:var(--muted);margin-bottom:5px}
+.cells{display:grid;grid-auto-flow:column;justify-content:start;overflow:visible;padding-bottom:15px}
+.c{width:var(--cw);height:31px;line-height:31px;text-align:center;
+   font:600 var(--fs)/31px ui-monospace,SFMono-Regular,Menlo,monospace;
+   background:var(--grey);color:#8a92a0;border-right:1px solid #fff;
+   position:relative;white-space:pre;overflow:hidden}
+.c.src,.c.doneCopy{background:#cfe0fb;color:#2b4a75}
+.c.doneAdd{background:#ffe6b0;color:#7a5a12}
+.c.run{background:var(--blue);color:#fff}
+.c.mismatch{background:var(--red);color:#fff}
+.c.win{box-shadow:inset 0 -4px 0 #a9c9f8}
+.c.gapzone{background:#f0d9a8;color:#7a5a12}
+.c.anchor{background:#0b3c8f;color:#fff}
+.c.bad{background:var(--red);color:#fff}
+.c.good{background:var(--green);color:#fff}
+.c.ext{box-shadow:inset 0 -4px 0 #16a34a}
+.c.skipzone{background:#ffd28a;color:#7a5a12}
+.c.indexed{background:#e3ecfd}
+.c.idxkey{box-shadow:inset 0 -4px 0 #0b3c8f}
+#idxcard[hidden]{display:none}
+.idx{display:flex;flex-wrap:wrap;gap:5px;max-height:150px;overflow:auto}
+.idx i{font-style:normal;font:600 12.5px ui-monospace,Menlo,monospace;
+       background:#e8eefb;border:1px solid #d3ddf3;border-radius:7px;padding:3px 8px;color:#2b4a75}
+.idx i.hot{background:#0b3c8f;border-color:#0b3c8f;color:#fff}
+.idx i.hotbad{background:#fbe1d6;border-color:#e9b9a3;color:#8a2f0b}
+.c.cur{z-index:3}
+.c.cur::before{content:'';position:absolute;left:-1px;top:-3px;bottom:-3px;width:3px;background:var(--ink)}
+.c.cur::after{content:'';position:absolute;left:50%;top:100%;margin-left:-7px;margin-top:2px;
+              border-left:7px solid transparent;border-right:7px solid transparent;
+              border-bottom:9px solid var(--ink)}
+
+.legend{display:flex;gap:15px;flex-wrap:wrap;font-size:14px;color:var(--muted);margin-top:12px}
+.legend span{display:flex;align-items:center;gap:7px}
+.sw{width:15px;height:15px;border-radius:4px;display:inline-block}
+
+.narr{background:#fff;border:1px solid var(--line);border-radius:20px;padding:22px 24px;
+      min-height:176px;display:flex;flex-direction:column;justify-content:center}
+.chip{align-self:flex-start;font-size:12px;font-weight:700;letter-spacing:.07em;
+      border-radius:999px;padding:4px 12px;background:#eef2f8;color:#41506b;margin-bottom:10px}
+.chip.ok{background:#d9f0e3;color:#0f5c36}
+.chip.no{background:#fbe1d6;color:#8a2f0b}
+.narr h3{margin:0 0 6px;font-size:23px;line-height:1.25}
+.narr p{margin:0;font-size:17px;color:#3d4550}
+.narr em{font-style:normal;font-family:ui-monospace,Menlo,monospace;font-size:.93em;
+         background:#eef2f8;border-radius:5px;padding:1px 6px;color:#26324a}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+
+.grid{display:grid;grid-template-columns:1.35fr .8fr .85fr;gap:16px}
+@media(max-width:900px){.grid{grid-template-columns:1fr}h1{font-size:31px}.narr{min-height:220px}}
+.mini h4{margin:0 0 10px;font-size:13px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase}
+.ops{font-family:ui-monospace,Menlo,monospace;font-size:14px;line-height:1.9;height:170px;overflow:auto}
+.ops span{display:inline-block;border-radius:8px;padding:2px 9px;margin:0 5px 5px 0}
+.ops .cp{background:#cfe0fb;color:#1b3f6b}
+.ops .ad{background:#ffe6b0;color:#7a5a12}
+.slots{display:flex;gap:7px;flex-wrap:wrap}
+.slots i{font-style:normal;font-family:ui-monospace,Menlo,monospace;font-size:14px;
+         background:#eef2f8;border:1px solid var(--line);border-radius:10px;padding:5px 11px}
+.slots i.zero{background:var(--ink);color:#fff;border-color:var(--ink)}
+.slots i.hot{background:#d9f0e3;border-color:#8fd0ae;color:#0f5c36}
+.stats{font-size:15px}
+.stats div{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px dashed #e8ebf0}
+.stats b{font-variant-numeric:tabular-nums}
+
+input[type=range]{width:100%;accent-color:#16181d}
+.pos{font-variant-numeric:tabular-nums;color:var(--muted);font-size:15px;min-width:96px;text-align:center}
+table.k{width:100%;border-collapse:collapse;font-size:15px}
+table.k td,table.k th{padding:8px 6px;border-bottom:1px solid var(--line);text-align:left}
+table.k th{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.note{font-size:15px;color:var(--muted)}
+footer{margin-top:34px;font-size:15px;color:var(--muted);text-align:center}
+footer a{color:var(--ink)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>The diff algorithm, step by step</h1>
+<p class="lede">How <a href="https://github.com/tochka-public/bitcut">bitcut</a> finds the difference between two
+documents without ever indexing either of them.</p>
+
+<div class="card">
+  <div class="row">
+    <b style="margin-right:6px">Example:</b>
+    <button data-preset="0" class="on">Ordinary edits</button>
+    <button data-preset="1">Sections swapped</button>
+    <button data-preset="2">Longer log</button>
+    <span class="note" style="margin-left:auto">Edit anything below and it re-runs</span>
+  </div>
+  <div class="row" style="margin-top:14px;align-items:stretch;gap:14px">
+    <div style="flex:1 1 340px">
+      <div class="striplab">OLD DOCUMENT</div>
+      <textarea id="oldText" spellcheck="false"></textarea>
+    </div>
+    <div style="flex:1 1 340px">
+      <div class="striplab">NEW DOCUMENT</div>
+      <textarea id="newText" spellcheck="false"></textarea>
+    </div>
+  </div>
+  <div class="knobs" id="knobs"></div>
+  <div class="bad" id="paramError" hidden></div>
+</div>
+
+<div class="card">
+  <div class="strip">
+    <div class="striplab">OLD &nbsp;<span class="note" id="oldlen"></span></div>
+    <div class="cells" id="old"></div>
+  </div>
+  <div class="strip" style="margin-top:20px">
+    <div class="striplab">NEW &nbsp;<span class="note" id="newlen"></span></div>
+    <div class="cells" id="new"></div>
+  </div>
+  <div class="legend">
+    <span><i class="sw" style="background:#e6eaf0"></i> untouched</span>
+    <span><i class="sw" style="background:#cfe0fb"></i> emitted as a copy</span>
+    <span><i class="sw" style="background:#ffe6b0"></i> emitted as a literal</span>
+    <span><i class="sw" style="background:#1d6feb"></i> run being compared</span>
+    <span><i class="sw" style="background:#0b3c8f"></i> anchor</span>
+    <span><i class="sw" style="background:#0f7b46"></i> accepted</span>
+    <span><i class="sw" style="background:#c2410c"></i> rejected / mismatch</span>
+    <span><i class="sw" style="background:#e3ecfd;box-shadow:inset 0 -4px 0 #0b3c8f"></i> position the index kept</span>
+    <span>▼ cursor</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row" style="justify-content:center">
+    <button id="first" title="Back to the start">⏮</button>
+    <button id="prev" class="big">← Back</button>
+    <span class="pos" id="pos"></span>
+    <button id="next" class="big">Next →</button>
+    <button id="jump">▶︎ Skip to next event</button>
+    <button id="play">Autoplay</button>
+  </div>
+  <input type="range" id="scrub" min="0" value="0" style="margin-top:14px">
+  <p class="note" style="margin:12px 0 0;text-align:center">
+    <span class="mono">←</span> <span class="mono">→</span> step ·
+    <span class="mono">space</span> skip to the next event
+  </p>
+</div>
+
+<div class="bad" id="selfcheck" hidden style="margin:-6px 0 18px"></div>
+
+<div class="narr" id="narr"></div>
+
+<div class="grid">
+  <div class="card mini">
+    <h4>Patch built so far</h4>
+    <div class="ops" id="ops"></div>
+  </div>
+  <div class="card mini">
+    <h4>Drift cache</h4>
+    <div class="slots" id="slots"></div>
+    <p class="note" style="margin-top:12px">Drift 0 is always tried first, before anything remembered.
+    The rest are kept most-recent-first.</p>
+  </div>
+  <div class="card mini">
+    <h4>Counters</h4>
+    <div class="stats" id="stats"></div>
+  </div>
+</div>
+
+<div class="card mini" id="idxcard" hidden>
+  <h4>The index &nbsp;<span class="note" id="idxn"></span></h4>
+  <div class="idx" id="idx"></div>
+</div>
+
+<div class="card">
+  <h4 style="margin:0 0 10px;font-size:13px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase">The index, when it gets built</h4>
+  <p class="note" style="margin:0">It holds <b>one position per key, and only the first</b>. A key that occurs
+  several times in the old document keeps its earliest occurrence and drops the rest, so the index never knows
+  all the offsets of anything — it knows one guess per key, which is then verified like any other candidate.
+  The key is a rolling hash of a fixed-width window rather than the bytes themselves, so distinct content can
+  collide onto one entry too. That is the opposite of the windowed search, which enumerates every occurrence
+  inside its window and tries them in order. Building the index costs a full pass over the base, which is
+  exactly why it is the last tier and not the first.</p>
+</div>
+
+<div class="card">
+  <h4 style="margin:0 0 10px;font-size:13px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase">Constants</h4>
+  <table class="k">
+    <tr><th>Name</th><th>Default in the crate</th><th>What it decides</th></tr>
+    <tr><td class="mono">MIN_MATCH</td><td class="mono">16</td><td>below this, a copy costs more than the literal it replaces</td></tr>
+    <tr><td class="mono">ANCHOR</td><td class="mono">32</td><td>length of the fragment searched for</td></tr>
+    <tr><td class="mono">VERIFY</td><td class="mono">64</td><td>how far a match must extend to be believed</td></tr>
+    <tr><td class="mono">GAPS</td><td class="mono">0, 32, 128, 512, 2048</td><td>offsets the anchor is taken from</td></tr>
+    <tr><td class="mono">WINDOW</td><td class="mono">±4096</td><td>half-width of the search window in the old document</td></tr>
+    <tr><td class="mono">SKIP</td><td class="mono">= the widest gap</td><td>derived, never set on its own</td></tr>
+    <tr><td class="mono">SLOTS</td><td class="mono">16</td><td>how many drifts are remembered</td></tr>
+  </table>
+  <p class="note" style="margin-top:14px">The presets scale everything down so the ladder is visible on a
+  document of a few dozen bytes. One rule is <b>not</b> scaled and cannot be: the index is built as soon as one
+  more round of local searching would cost as much as indexing the base outright. On a 70-byte base that is
+  almost immediately — indexing 70 bytes is free — which is why the short presets reach the index quickly and
+  the longer one gets to skip ahead first.</p>
+</div>
+
+<footer>
+  <a href="https://github.com/tochka-public/bitcut">github.com/tochka-public/bitcut</a> ·
+  the matcher on this page is <span class="mono">src/differ.rs</span> compiled to WebAssembly
+</footer>
+
+</div>
+
+<script type="module">
+// ===========================================================================
+// The matcher is the crate itself. This file only draws what it reports.
+// ===========================================================================
+const $ = (id) => document.getElementById(id);
+
+const KNOBS = [
+  { key:'min_match', label:'MIN_MATCH', hint:'shortest match worth an opcode' },
+  { key:'anchor',    label:'ANCHOR',    hint:'bytes searched for' },
+  { key:'verify',    label:'VERIFY',    hint:'bar a candidate must clear' },
+  { key:'gaps',      label:'GAPS',      hint:'anchor offsets, comma separated', text:true },
+  { key:'window',    label:'WINDOW ±',  hint:'half-width of the search window' },
+  { key:'slots',     label:'SLOTS',     hint:'drifts remembered' },
+];
+
+const entry = (i, word) => `|${String(i).padStart(2,'0')}.03 ${word} ${i * 10}`;
+const log = (n, word) => Array.from({ length:n }, (_, i) => entry(i + 1, word)).join('');
+
+const PRESETS = [
+  { old:"cp:Acme,Borg,Cyan|01.03 pay 10|01.03 fee 20|01.03 pay 30|01.03 fee 40",
+    new:"cp:Acme,Beta,Borg,Cyan|01.03 payed 10|01.03 fee 20|01.03 payed 30|01.03 fee 40|01.03 fee 50",
+    p:{ min_match:6, anchor:6, verify:14, gaps:'0,2,6,8', window:16, slots:4 } },
+  { old:"cp:Acme,Borg,Cyan|01.03 done|02.03 done|09.09 audit|10.09 audit|11.09 audit",
+    new:"|09.09 audit|10.09 audit|11.09 auditcp:Acme,Borg,Cyan|01.03 done|02.03 done",
+    p:{ min_match:6, anchor:6, verify:14, gaps:'0,2,6,8', window:16, slots:4 } },
+  { old:"cp:Acme,Borg,Cyan" + log(12, 'pay'),
+    new:"cp:Acme,Beta,Borg,Cyan" + log(12, 'pay')
+          .replace("|03.03 pay 30", "|03.03 payed 30")
+          .replace("|07.03 pay 70", "|07.03 payed 70") + "|13.03 pay 130|14.03 pay 140",
+    p:{ min_match:6, anchor:6, verify:14, gaps:'0,2,6,8', window:6, slots:4 } },
+];
+
+// --------------------------------------------------------------- wasm bridge
+let W = null;
+const REJECTED = 0xFFFF_FFFF;
+
+async function boot() {
+  const response = await fetch('bitcut.wasm');
+  const { instance } = await WebAssembly.instantiate(await response.arrayBuffer(), {});
+  W = instance.exports;
+}
+
+/// Run the real matcher and return its decision log, or null if it refused
+/// the parameters.
+function trace(oldText, newText, p) {
+  const encoder = new TextEncoder();
+  const o = encoder.encode(oldText), n = encoder.encode(newText);
+  const gaps = Uint32Array.from(p.gaps);
+  const op = W.alloc(o.length || 1), np = W.alloc(n.length || 1), gp = W.alloc(gaps.length * 4);
+  try {
+    new Uint8Array(W.memory.buffer).set(o, op);
+    new Uint8Array(W.memory.buffer).set(n, np);
+    new Uint32Array(W.memory.buffer, gp, gaps.length).set(gaps);
+    const len = W.trace(op, o.length, np, n.length,
+      p.min_match, p.anchor, p.verify, gp, gaps.length, p.window, p.slots) >>> 0;
+    if (len === REJECTED) return null;
+    return JSON.parse(new TextDecoder().decode(
+      new Uint8Array(W.memory.buffer, W.result_ptr(), len)));
+  } finally {
+    W.dealloc(op, o.length || 1);
+    W.dealloc(np, n.length || 1);
+    W.dealloc(gp, gaps.length * 4);
+  }
+}
+
+// ----------------------------------------------------------------- app state
+let OLD = '', NEW = '', P = null, FR = [], KEY_BYTES = 10, KEYS = [], at = 0, timer = null;
+
+function readParams() {
+  const p = {};
+  for (const k of KNOBS) {
+    const raw = $('knob-' + k.key).value.trim();
+    if (k.text) {
+      p.gaps = raw.split(',')
+        .map((v) => Number.parseInt(v, 10))
+        .filter((v) => Number.isFinite(v) && v >= 0)
+        .slice(0, 8);
+    } else {
+      p[k.key] = Math.max(0, Number.parseInt(raw, 10) || 0);
+    }
+  }
+  if (!p.gaps.length) p.gaps = [0];
+  return p;
+}
+
+const cell = (ch) => (ch === ' ' ? '␣' : ch)
+  .replace(/[&<>]/g, (m) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;' }[m]));
+
+function rebuild() {
+  OLD = $('oldText').value;
+  NEW = $('newText').value;
+  P = readParams();
+  const frames = trace(OLD, NEW, P);
+  if (!frames) {
+    $('paramError').hidden = false;
+    $('paramError').textContent =
+      'The matcher refused these parameters. It wants a gap ladder starting at 0 and ascending, '
+      + 'MIN_MATCH ≤ ANCHOR ≤ VERIFY, a window at least as wide as the anchor, and SLOTS ≤ 16. '
+      + 'A rejected combination would still produce a correct patch — just a worse one, so the check '
+      + 'is advice, not protection.';
+    return;
+  }
+  $('paramError').hidden = true;
+  FR = frames;
+  const built = frames.find((f) => f.t === 'index-built');
+  KEY_BYTES = built?.keyBytes ?? 10;
+  KEYS = built?.positions ?? [];
+  $('old').innerHTML = [...OLD].map((c) => `<span class="c">${cell(c)}</span>`).join('');
+  $('new').innerHTML = [...NEW].map((c) => `<span class="c">${cell(c)}</span>`).join('');
+  $('oldlen').textContent = OLD.length + ' bytes';
+  $('newlen').textContent = NEW.length + ' bytes';
+  $('scrub').max = Math.max(0, FR.length - 1);
+
+  // The log has to account for every byte. If replaying only the recorded
+  // opcodes does not rebuild the new document, the page is describing a patch
+  // the matcher did not produce, and saying so is better than drawing it.
+  const rebuilt = opsUpTo(FR.length - 1)
+    .map((c) => c.k === 'copy' ? OLD.substr(c.offset, c.len) : NEW.substr(c.start, c.len))
+    .join('');
+  const sound = rebuilt === NEW;
+  $('selfcheck').hidden = sound;
+  if (!sound) {
+    $('selfcheck').textContent =
+      `Self-check failed: replaying the recorded opcodes rebuilds ${rebuilt.length} of `
+      + `${NEW.length} bytes. The decision log is incomplete — what is drawn below is not the `
+      + `whole patch.`;
+  }
+
+  fit();
+  go(0);
+}
+
+function fit() {
+  const box = $('old').parentElement.getBoundingClientRect().width;
+  const n = Math.max(OLD.length, NEW.length, 1);
+  const cw = Math.max(3, Math.floor(box / n));
+  document.documentElement.style.setProperty('--cw', cw + 'px');
+  document.documentElement.style.setProperty('--fs', (cw >= 10 ? 11 : cw >= 8 ? 9 : 0) + 'px');
+}
+
+// ------------------------------------------------------------------ painting
+const oldCells = () => $('old').children;
+const newCells = () => $('new').children;
+function mark(cells, from, len, cls) {
+  for (let x = from; x < from + len; x++) cells[x]?.classList.add(cls);
+}
+
+/// The opcodes emitted up to and including frame `n`, replayed from the log.
+function opsUpTo(n) {
+  const ops = [];
+  for (let i = 0; i <= n; i++) {
+    const f = FR[i];
+    if (f.t === 'restart') ops.length = 0;
+    else if (f.t === 'copy') ops.push({ k:'copy', offset:f.offset, len:f.len });
+    else if (f.t === 'literal' && f.len > 0) {
+      const last = ops[ops.length - 1];
+      if (last && last.k === 'add' && last.start + last.len === f.start) last.len += f.len;
+      else ops.push({ k:'add', start:f.start, len:f.len });
+    }
+  }
+  return ops;
+}
+
+const indexedBy = (n) => FR.slice(0, n + 1).some((f) => f.t === 'index-built');
+
+/// The gap frame the current frame belongs to, if any.
+function lastGap(n) {
+  for (let i = n; i >= 0; i--) {
+    if (FR[i].t === 'gap') return FR[i];
+    if (['resync','copy','compared','restart'].includes(FR[i].t)) return null;
+  }
+  return null;
+}
+
+function paint(f, n) {
+  const O = oldCells(), N = newCells();
+  for (const c of O) c.className = 'c';
+  for (const c of N) c.className = 'c';
+
+  let out = 0;
+  for (const c of opsUpTo(n)) {
+    if (c.k === 'copy') { mark(N, out, c.len, 'doneCopy'); mark(O, c.offset, c.len, 'src'); }
+    else mark(N, out, c.len, 'doneAdd');
+    out += c.len;
+  }
+  if (indexedBy(n)) {
+    for (const c of O) c.classList.add('indexed');
+    for (const p of KEYS) O[p]?.classList.add('idxkey');
+  }
+
+  const gap = lastGap(n);
+  if (gap && ['gap','drift','window','candidate','aligned'].includes(f.t)) {
+    mark(N, f.new, gap.gap, 'gapzone');
+    mark(N, gap.atNew, P.anchor, 'anchor');
+  }
+
+  switch (f.t) {
+    case 'compared':
+      mark(N, f.new, f.run, 'run'); mark(O, f.old, f.run, 'run');
+      if (!f.ok) { mark(N, f.new + f.run, 1, 'mismatch'); mark(O, f.old + f.run, 1, 'mismatch'); }
+      break;
+    case 'drift':
+      if (f.at !== undefined) {
+        mark(O, f.at, P.anchor, f.ok ? 'good' : 'bad');
+        mark(O, f.at, f.extends, 'ext');
+      }
+      break;
+    case 'window':
+      mark(O, f.lo, f.hi - f.lo, 'win');
+      break;
+    case 'candidate':
+      mark(O, f.at, P.anchor, f.ok ? 'good' : 'bad');
+      mark(O, f.at, f.extends, 'ext');
+      break;
+    case 'aligned':
+      mark(O, f.at, P.anchor, 'good');
+      mark(N, f.new, f.literal, 'skipzone');
+      break;
+    case 'skip':
+      mark(N, f.new, f.len, 'skipzone');
+      break;
+    case 'index-probe':
+      mark(O, f.at, KEY_BYTES, f.ok ? 'good' : 'bad');
+      mark(O, f.at, f.extends, 'ext');
+      mark(N, f.new + f.step, KEY_BYTES, 'anchor');
+      break;
+    default:
+      break;
+  }
+
+  N[f.new]?.classList.add('cur');
+  O[f.old]?.classList.add('cur');
+}
+
+// ----------------------------------------------------------------- narration
+const E = (v) => `<em>${v}</em>`;
+const C = (name, value) => `<em>${name} ${value}</em>`;
+const Q = (s) => `<em>“${String(s).replace(/ /g,'␣')}”</em>`;
+const signed = (d) => (d < 0 ? `− ${-d}` : `+ ${d}`);
+
+function narrate(f, n) {
+  const gap = lastGap(n);
+  const round = P.window * 2 * P.gaps.length;
+  switch (f.t) {
+    case 'compared': return f.ok
+      ? ['COMPARE', `${f.run} bytes match`,
+         `Comparing the two documents from the cursors onward. ${E(f.run)} ≥ ${C('MIN_MATCH', P.min_match)}, so a copy pays for itself: one opcode instead of ${f.run} literal bytes.`]
+      : ['COMPARE', f.run === 0 ? 'The bytes differ immediately' : `Only ${f.run} bytes match`,
+         'The red cell is where they diverge. '
+         + (f.run === 0 ? '' : `${E(f.run)} &lt; ${C('MIN_MATCH', P.min_match)}, so a copy would cost more than the literal it replaces. `)
+         + 'Now find where the two documents line up again.'];
+
+    case 'copy': return ['EMIT', `Copy(${f.offset}, ${f.len})`,
+      `Write “copy ${f.len} bytes from offset ${f.offset} of the old document”. Both cursors advance by ${f.len}.`];
+
+    case 'resync': return ['RESYNC', 'Find where the old document continues',
+      `Tier 1 is the drift cache. It is not a search — it is checking hypotheses already held, at most ${C('SLOTS', P.slots)} of them plus drift 0, one comparison each.`];
+
+    case 'gap-too-late': return ['GAP SKIPPED', `Gap ${f.gap} does not fit`,
+      `An anchor is ${C('ANCHOR', P.anchor)} bytes long, and ${E(`${f.new} + ${f.gap} + ${P.anchor} = ${f.new + f.gap + P.anchor}`)} runs past the end of the ${NEW.length}-byte new document.`];
+
+    case 'gap': {
+      const left = NEW.length - f.atNew;
+      const bar = f.need < P.verify
+        ? `Only ${left} bytes are left, so the bar drops to ${E(`need = min(VERIFY ${P.verify}, ${left}) = ${f.need}`)}.`
+        : `The bar is ${E(`need = min(VERIFY ${P.verify}, ${left} left) = ${f.need}`)}.`;
+      return [`GAP ${f.gap}`, `Anchor ${Q(f.anchor)}`,
+        `Take ${C('ANCHOR', P.anchor)} bytes from the new document at position ${f.atNew}, which is ${f.gap} past the divergence — entry ${P.gaps.indexOf(f.gap) + 1} of ${P.gaps.length} in ${C('GAPS', P.gaps.join(','))}. `
+        + (f.gap === 0
+            ? 'Gap 0 means right at the divergence point. '
+            : 'The gap exists to step over the newly written bytes, which are not in the old document at all. ')
+        + bar];
+    }
+
+    case 'drift': {
+      if (f.oob) return [`DRIFT ${f.drift}`, 'Outside the document',
+        `Expected position ${gap?.atOld} ${signed(f.drift)} lands outside the ${OLD.length}-byte old document. Skip it.`];
+      return [f.ok ? 'HIT' : 'MISS',
+        `${f.drift === 0 ? 'Drift 0' : `Remembered drift ${f.drift}`} → old position ${f.at}`,
+        (f.drift === 0
+          ? 'Drift 0 means an edit that changed no length. It is tried before anything remembered, because it is the most common case. '
+          : 'This drift is in the cache from an earlier edit. ')
+        + `Old position ${gap?.atOld} ${signed(f.drift)} = ${f.at}. From there the match extends ${E(f.extends)}, against a bar of ${E(gap?.need)}. ${f.extends} ${f.ok ? '≥' : '&lt;'} ${gap?.need} → ${f.ok ? 'accepted.' : 'rejected.'}`];
+    }
+
+    case 'window': return ['WINDOW', `Searching old[${f.lo}, ${f.hi})`,
+      `Tier 2. The window is the expected position ${gap?.atOld} ± ${C('WINDOW', P.window)}, plus room for the anchor and clamped to the document — ${f.hi - f.lo} of the ${OLD.length} bytes. The rest is never looked at. Inside it the search is exhaustive, and occurrences are verified one at a time, in order.`];
+
+    case 'candidate': return [f.ok ? 'VERIFIED' : 'FALSE FRIEND',
+      `Candidate at ${f.at}: extends ${f.extends}, bar is ${gap?.need}`,
+      f.ok
+        ? `${E(f.extends)} ≥ ${E(gap?.need)}, so the match continues far enough to be believed. Accepted.`
+        : `${E(f.extends)} &lt; ${E(gap?.need)}: the ${P.anchor}-byte anchor matched, but the bytes after it do not. Fragments this short repeat all over a real document — without the ${C('VERIFY', P.verify)} check the differ would align to the wrong place and dump the whole remainder into one huge literal.`];
+
+    case 'aligned': {
+      let body = f.via === 'cache'
+        ? `The same edit shape occurred before, so drift ${E(f.drift)} was already in the cache. No search happened at all — this is how most resyncs are answered on real data.`
+        : `Drift is ${E(`found ${f.at} − expected ${gap?.atOld} = ${f.drift}`)}. It goes into the cache, so the next edit of the same shape costs no search.`;
+      if (f.walkedBack > 0) {
+        body += ` Then walk backwards while the bytes to the left still agree: ${f.walkedBack} step${f.walkedBack === 1 ? '' : 's'}, so the literal shrinks from the gap ${f.gap} to ${E(f.literal)}. Those bytes belong in the copy, not the literal.`;
+      }
+      return [f.via === 'cache' ? 'HIT, NO SEARCH' : 'ALIGNMENT FOUND',
+        f.via === 'cache' ? `The drift cache answered it: drift ${f.drift}` : `Old position ${f.at}, drift ${f.drift}`,
+        body];
+    }
+
+    case 'literal': return ['EMIT',
+      f.len === 0 ? `Empty literal — just move the old cursor to ${f.resume}` : `Add(${f.len} bytes)`,
+      (f.len === 0
+        ? 'Nothing to insert: the backward walk returned the whole overshoot to the copy. '
+        : `Write “insert these ${f.len} bytes”. `)
+      + `The old cursor moves to ${f.resume}.`];
+
+    case 'resync-failed': return ['NO LUCK', 'Every probe failed',
+      `All ${P.gaps.length} gaps of ${C('GAPS', P.gaps.join(','))} were tried against the drift cache and then against the window. Nothing verified.`];
+
+    case 'ladder': return f.escalating
+      ? ['LADDER', 'Time to build the index',
+         `One more round of local searching would walk about ${E(round)} bytes on top of the ${E(f.scanned)} already read, and indexing the whole ${E(f.threshold)}-byte base costs less than that. So index it.`]
+      : ['LADDER', 'The index does not pay for itself yet',
+         `${E(f.scanned)} bytes of the base read so far, and one more round walks about ${E(round)} — still under the ${E(f.threshold)} bytes indexing would cost. So these are simply new bytes with no counterpart in the old document.`];
+
+    case 'skip': return ['SKIP AHEAD', `Carry ${f.len} bytes and probe further along`,
+      `The skip is the widest entry of ${C('GAPS', P.gaps.join(','))} — and every gap up to it just failed, so those ${f.len} bytes provably contain no resync point. Stepping any further would jump over ground nobody looked at. Consecutive skips merge into one literal.`];
+
+    case 'index-built': {
+      const slots = Math.max(0, OLD.length - f.keyBytes + 1);
+      return ['GLOBAL INDEX', `Built: ${f.entries} entries`,
+        `One entry per ${E(f.keyBytes)}-byte window of the old document, keyed by a rolling hash, keeping the first occurrence of each. There are ${E(slots)} such windows and ${E(f.entries)} entries, so ${E(slots - f.entries)} positions were dropped as later occurrences of a key already stored. The kept ones are underlined on the old strip: those are the only places the index can point at.`];
+    }
+
+    case 'index-probe': return [f.ok ? 'FOUND' : 'MISS',
+      `Old position ${f.at}, extends ${f.extends}`,
+      `Walking forward through the new document; this is offset ${f.step} from the cursor. `
+      + (f.ok
+        ? `The match extends ${E(f.extends)} ≥ ${C('MIN_MATCH', P.min_match)}, so take it. Note how far ${f.at} is — no window of half-width ${P.window} would ever have reached it.`
+        : `It extends ${E(f.extends)} &lt; ${C('MIN_MATCH', P.min_match)}, so it is not worth an opcode. Keep walking.`)];
+
+    case 'index-exhausted': return ['SEARCH EXHAUSTED', 'The index swept the whole remainder — nothing',
+      'Every position was checked and none extended far enough. There are no more matches and there will not be any.'];
+
+    case 'restart': return ['RESTART', 'Redo the diff with the index in hand',
+      `The index exists now, so the whole document is visible. Everything decided before it existed was decided blind — in particular the ${E(f.carried)} literal bytes carried by skip-ahead, which gave up on content the index can find. Drop the opcodes and start over from zero. The index is built once, so this happens once.`];
+
+    case 'finished': return ['FINAL', 'Carry the remainder verbatim',
+      'Nothing further can match, so the rest of the new document goes into the patch as it is.'];
+
+    default: return [f.t.toUpperCase(), '', ''];
+  }
+}
+
+// -------------------------------------------------------------------- render
+function render() {
+  if (!FR.length) return;
+  const f = FR[at];
+  paint(f, at);
+  const [chip, title, body] = narrate(f, at);
+  const good = /HIT|VERIFIED|FOUND|EMIT|ALIGNMENT|GLOBAL|RESTART|FINAL/.test(chip);
+  const bad = /MISS|FALSE|NO LUCK|EXHAUSTED/.test(chip);
+  $('narr').innerHTML = `<span class="chip ${good ? 'ok' : bad ? 'no' : ''}">${chip}</span>`
+    + `<h3>${title}</h3><p>${body}</p>`;
+
+  $('ops').innerHTML = opsUpTo(at).map((c) =>
+    c.k === 'copy'
+      ? `<span class="cp">Copy(${c.offset},${c.len})</span>`
+      : `<span class="ad">Add "${NEW.substr(c.start, c.len).replace(/ /g,'␣')}"</span>`
+  ).join('') || '<span class="note">nothing yet</span>';
+
+  const hot = f.t === 'drift' ? f.drift : (f.t === 'aligned' && f.via === 'cache' ? f.drift : null);
+  const drifts = lastGap(at)?.drifts ?? [];
+  $('slots').innerHTML = `<i class="zero${hot === 0 ? ' hot' : ''}">0</i>`
+    + drifts.map((d) => `<i${d === hot ? ' class="hot"' : ''}>${d > 0 ? '+' : ''}${d}</i>`).join('');
+
+  const s = f.s;
+  $('stats').innerHTML =
+    `<div><span>copies</span><b>${s[0]}</b></div>`
+    + `<div><span>literals</span><b>${s[1]}</b></div>`
+    + `<div><span>resyncs</span><b>${s[2]}</b></div>`
+    + `<div><span>answered by cache</span><b>${s[3]}</b></div>`
+    + `<div><span>window searches</span><b>${s[4]}</b></div>`
+    + `<div><span>base bytes read</span><b>${s[5]}</b></div>`
+    + `<div><span>escalations</span><b>${s[6]}</b></div>`
+    + `<div><span>restarts</span><b>${s[7]}</b></div>`;
+
+  renderIndex(f, at);
+  $('pos').textContent = `${at + 1} / ${FR.length}`;
+  $('scrub').value = at;
+  $('prev').disabled = at === 0;
+  $('first').disabled = at === 0;
+  $('next').disabled = at === FR.length - 1;
+}
+
+function renderIndex(f, n) {
+  if (!indexedBy(n) || !KEYS.length) { $('idxcard').hidden = true; return; }
+  $('idxcard').hidden = false;
+  const slots = Math.max(0, OLD.length - KEY_BYTES + 1);
+  $('idxn').textContent =
+    `${KEYS.length} entries from ${slots} positions — ${slots - KEYS.length} dropped as duplicate keys`;
+  const hot = f.t === 'index-probe' ? f.at : null;
+  $('idx').innerHTML = KEYS.map((p) =>
+    `<i class="${p === hot ? (f.ok ? 'hot' : 'hotbad') : ''}">${p}</i>`).join('');
+  const el = $('idx').querySelector('.hot, .hotbad');
+  if (el) {
+    const box = $('idx');
+    const top = el.offsetTop - box.offsetTop;
+    if (top < box.scrollTop || top + el.offsetHeight > box.scrollTop + box.clientHeight) {
+      box.scrollTop = top - box.clientHeight / 2 + el.offsetHeight;
+    }
+  }
+}
+
+const MILESTONE = new Set([
+  'copy','literal','aligned','skip','index-built','finished','candidate','ladder','restart','index-probe',
+]);
+function go(n) { at = Math.max(0, Math.min(FR.length - 1, n)); render(); }
+function jump() { let n = at + 1; while (n < FR.length - 1 && !MILESTONE.has(FR[n].t)) n++; go(n); }
+function toggle() {
+  if (timer) { clearInterval(timer); timer = null; $('play').className = ''; return; }
+  $('play').className = 'on';
+  timer = setInterval(() => { if (at >= FR.length - 1) toggle(); else go(at + 1); }, 500);
+}
+
+// -------------------------------------------------------------------- wiring
+$('knobs').innerHTML = KNOBS.map((k) =>
+  `<div class="knob"><label for="knob-${k.key}">${k.label}</label>`
+  + `<input id="knob-${k.key}"${k.text ? '' : ' type="number" min="0"'} value="">`
+  + `<small>${k.hint}</small></div>`).join('');
+
+function loadPreset(i) {
+  const preset = PRESETS[i];
+  $('oldText').value = preset.old;
+  $('newText').value = preset.new;
+  for (const k of KNOBS) $('knob-' + k.key).value = preset.p[k.key];
+  document.querySelectorAll('[data-preset]').forEach((b) => {
+    b.className = Number(b.dataset.preset) === i ? 'on' : '';
+  });
+  rebuild();
+}
+
+let debounce = null;
+const scheduleRebuild = () => {
+  clearTimeout(debounce);
+  debounce = setTimeout(rebuild, 180);
+};
+
+document.querySelectorAll('[data-preset]').forEach((b) => {
+  b.onclick = () => { if (timer) toggle(); loadPreset(Number(b.dataset.preset)); };
+});
+for (const id of ['oldText','newText']) $(id).addEventListener('input', scheduleRebuild);
+for (const k of KNOBS) $('knob-' + k.key).addEventListener('input', scheduleRebuild);
+
+$('prev').onclick = () => go(at - 1);
+$('next').onclick = () => go(at + 1);
+$('first').onclick = () => go(0);
+$('jump').onclick = jump;
+$('play').onclick = toggle;
+$('scrub').oninput = (e) => go(+e.target.value);
+document.addEventListener('keydown', (e) => {
+  if (['TEXTAREA','INPUT'].includes(e.target.tagName)) return;
+  if (e.key === 'ArrowRight') { e.preventDefault(); go(at + 1); }
+  if (e.key === 'ArrowLeft')  { e.preventDefault(); go(at - 1); }
+  if (e.key === ' ')          { e.preventDefault(); jump(); }
+});
+window.addEventListener('resize', fit);
+
+await boot();
+loadPreset(0);
+</script>
+</body>
+</html>
