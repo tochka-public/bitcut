@@ -1,9 +1,6 @@
 ---
 source: src/lib.rs
+assertion_line: 164
 expression: ops
 ---
-[
-    Add(
-        Text(""),
-    ),
-]
+[]
