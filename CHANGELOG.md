@@ -7,6 +7,13 @@ trailer is what makes a release major.
 Releases up to `v0.1.6` predate this file. They are on
 [crates.io](https://crates.io/crates/bitcut/versions) and in the git history.
 
+## [1.0.1](https://github.com/tochka-public/bitcut/compare/v1.0.0...v1.0.1) - 2026-09-07
+
+### Documentation
+
+- medians instead of best-of-five, and why escalation beats indexing first
+- bring the README back in line with what shipped
+
 ## [1.0.0](https://github.com/tochka-public/bitcut/compare/v0.1.6...v1.0.0) - 2026-09-06
 
 ### Added
