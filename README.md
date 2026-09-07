@@ -27,21 +27,31 @@ counts how often that happened.
 
 ## Measurements
 
-Against the crate's own 0.1.6, which is the index-first implementation. Best of
-five runs on an M-series laptop, patch sizes uncompressed.
+Against the crate's own 0.1.6, which is the index-first implementation. Median
+of 25 runs on an M-series laptop, patch sizes uncompressed.
 
 | shape | base | 0.1.6 | this | peak heap, 0.1.6 | peak heap, this | patch, 0.1.6 | patch, this |
 |---|---|---|---|---|---|---|---|
-| one insertion | 2.0 MiB | 18.7 ms | 0.23 ms | 51 MiB | 64 KiB | 31 B | 60 B |
-| 40 scattered edits | 1.5 MiB | 16.9 ms | 0.10 ms | 51 MiB | 68 KiB | 855 B | 474 B |
-| 5% appended | 1.5 MiB | 17.1 ms | 0.11 ms | 51 MiB | 192 KiB | 80 268 B | 80 062 B |
-| halves swapped | 1.5 MiB | 16.5 ms | 5.45 ms | 51 MiB | 34 MiB | 27 B | 59 B |
-| unrelated documents | 1.5 MiB | 23.9 ms | 15.3 ms | 51 MiB | 39 MiB | 1 573 392 B | 1 192 561 B |
+| one insertion | 2.0 MiB | 20.3 ms | 0.11 ms | 51 MiB | 64 KiB | 31 B | 60 B |
+| 40 scattered edits | 1.5 MiB | 17.3 ms | 0.10 ms | 51 MiB | 68 KiB | 855 B | 474 B |
+| 5% appended | 1.5 MiB | 17.7 ms | 0.11 ms | 51 MiB | 192 KiB | 80 268 B | 80 062 B |
+| halves swapped | 1.5 MiB | 17.4 ms | 5.50 ms | 51 MiB | 34 MiB | 27 B | 59 B |
+| unrelated documents | 1.5 MiB | 29.0 ms | 15.8 ms | 51 MiB | 39 MiB | 1 573 392 B | 1 192 561 B |
+
+The two escalating rows swing by tens of percent with how warm the machine is.
+The first three do not.
 
 The last two rows are the shapes local search cannot see. They build the index
 after all, and the heap goes with it. Searching before giving up is not free,
 but it is bounded: the matcher stops once fruitless scanning has cost about
 what the index costs, so the worst case is the index plus that much again.
+
+They still come out ahead of indexing first, for two reasons that have nothing
+to do with the search. The table is reserved at its final size instead of
+grown by doubling, which is where 0.1.6 spends 51 MiB to hold 32 MiB of
+entries and re-hashes every key it has already inserted on each doubling. And
+the index is consulted only at divergences, where 0.1.6 recomputes a ten-byte
+hash from scratch at every byte it fails to match.
 
 The smallest patches grew because v2 carries a 38-byte header. The opcode
 encoding wins some of that back, so the net cost on a one-insertion patch is 29
